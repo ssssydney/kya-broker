@@ -23,7 +23,7 @@ from .intent import Intent, IntentState, assert_transition
 from .paths import ledger_path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 SCHEMA_SQL = """
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS intents (
     rationale TEXT NOT NULL,
     estimated_actual_cost_usd REAL NOT NULL,
     references_json TEXT NOT NULL,
+    rail_hint TEXT,
     issuer_session TEXT,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
@@ -114,8 +115,16 @@ def init_ledger(db_path: Path | None = None) -> None:
         row = cur.fetchone()
         if row is None:
             conn.execute("INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,))
-        elif row["version"] != SCHEMA_VERSION:
-            # naive forward-migration placeholder; real migrations would live here
+        else:
+            current = int(row["version"])
+            if current < 3:
+                # v3 added intents.rail_hint. Existing rows get NULL.
+                cols = {
+                    r["name"]
+                    for r in conn.execute("PRAGMA table_info(intents)").fetchall()
+                }
+                if "rail_hint" not in cols:
+                    conn.execute("ALTER TABLE intents ADD COLUMN rail_hint TEXT")
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
         conn.commit()
 
@@ -145,9 +154,9 @@ class Ledger:
                 """
                 INSERT INTO intents (
                     intent_id, merchant, amount_usd, rationale,
-                    estimated_actual_cost_usd, references_json, issuer_session,
+                    estimated_actual_cost_usd, references_json, rail_hint, issuer_session,
                     created_at, expires_at, current_state, tier, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     intent.intent_id,
@@ -156,6 +165,7 @@ class Ledger:
                     intent.rationale,
                     intent.estimated_actual_cost_usd,
                     json.dumps(intent.references),
+                    intent.rail_hint,
                     intent.issuer_session,
                     intent.to_dict()["created_at"],
                     intent.to_dict()["expires_at"],

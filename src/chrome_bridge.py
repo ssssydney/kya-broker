@@ -1,27 +1,28 @@
-"""Bridge to Claude in Chrome (or a plain CDP Chrome instance) for running playbooks.
+"""Bridge to the user's Chrome for executing merchant checkout playbooks.
 
 Design boundary:
-  * We DO NOT automate the MetaMask confirm button. That's the user's L2 authorization.
-  * We DO drive the rest of the vast.ai checkout flow: clicking Add Credits, entering
-    amount, selecting the crypto rail, waiting for the MetaMask popup to appear,
-    detecting settlement, etc.
-  * When Claude in Chrome MCP is available (default), we translate playbook steps
-    into calls against it. Otherwise we fall back to raw CDP via pychrome.
+  * We drive the browser up to the point where a HumanGate fires (card entry,
+    3DS, magic-link click, MetaMask sign, OTP). At that moment we stop driving
+    and let the user finish the step in the tab.
+  * We detect completion / decline by polling the DOM for textual or URL-based
+    signals declared in the playbook step.
+  * No rail-specific logic lives here. `wait_for_metamask_popup` etc. are all
+    just convenience wrappers around `wait_for_human:`.
 
-The PlaybookResult returned is deliberately shallow — Broker only needs:
-    state in {"settled", "user_declined", "timeout", "failed"}
-    tx_hash / merchant_receipt_id / actual_cost_usd (when available)
-    error (human-readable) on failure
-
-A live Chrome instance is not required to import this module; `is_available()` and
-run_playbook() raise ChromeUnavailableError if not.
+Backends, in order of preference:
+  1. Claude-in-Chrome MCP (when the runner has access — translates to semantic
+     actions and tolerates UI drift gracefully).
+  2. Raw CDP via `pychrome` (what this module actually implements).
+  3. Dry-run simulator (`KYA_BROKER_DRY_RUN=1`), used in tests and setup smoke.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
+import base64
 import logging
+import os
+import re
 import shutil
 import socket
 import time
@@ -31,7 +32,19 @@ from typing import Any
 
 import yaml
 
-from .config import ChromeConfig
+from .config import ChromeConfig, MerchantConfig, NotificationConfig
+from .human_gate import (
+    DEFAULT_COMPLETION_KEYWORDS,
+    DEFAULT_DECLINE_KEYWORDS,
+    HumanGate,
+    HumanGateOutcome,
+    HumanGateReason,
+    HumanGateRequest,
+    build_page_text_predicate,
+    build_selector_predicate,
+    build_url_predicate,
+    default_human_prompt,
+)
 from .intent import Intent
 from .paths import dumps_dir, playbook_dir
 
@@ -52,20 +65,58 @@ class PlaybookResult:
     dom_dump_path: str | None = None
 
 
-class ChromeBridge:
-    """Translates YAML playbooks into browser actions.
+# --------------------------------------------------------------------------
+# Template rendering
 
-    The bridge supports three backends, in order of preference:
-      1. `claude-in-chrome` MCP client — high-level semantic actions.
-      2. Raw CDP (Chrome DevTools Protocol) via HTTP.
-      3. Dry-run simulator (KYA_BROKER_DRY_RUN=1) — no browser, used for tests.
+
+_TEMPLATE_RE = re.compile(r"\$\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
+
+
+def _render_template(value: Any, intent: Intent, merchant: MerchantConfig) -> Any:
+    """Substitute ${{ intent.X }} and ${{ merchant.X }} placeholders in strings.
+
+    Nested dicts and lists are walked recursively. Non-string leaves are returned
+    unchanged.
     """
+    if isinstance(value, str):
+        def replace(m: re.Match[str]) -> str:
+            path = m.group(1).split(".")
+            root = {"intent": intent, "merchant": merchant}.get(path[0])
+            if root is None:
+                return m.group(0)
+            cur: Any = root
+            for part in path[1:]:
+                cur = getattr(cur, part, None)
+                if cur is None:
+                    return m.group(0)
+            return str(cur)
 
-    def __init__(self, cfg: ChromeConfig):
+        return _TEMPLATE_RE.sub(replace, value)
+    if isinstance(value, list):
+        return [_render_template(v, intent, merchant) for v in value]
+    if isinstance(value, dict):
+        return {k: _render_template(v, intent, merchant) for k, v in value.items()}
+    return value
+
+
+# --------------------------------------------------------------------------
+
+
+class ChromeBridge:
+    def __init__(
+        self,
+        cfg: ChromeConfig,
+        notifications: NotificationConfig | None = None,
+    ):
         self.cfg = cfg
+        self.notifications = notifications or NotificationConfig()
         self._backend: str | None = None
+        self._human_gate = HumanGate(
+            channels=self.notifications.channels,
+            poll_interval_s=self.notifications.poll_interval_s,
+        )
 
-    # ---- availability ----------------------------------------------------
+    # ---- availability -----------------------------------------------
 
     def is_available(self) -> bool:
         if _env_flag("KYA_BROKER_DRY_RUN"):
@@ -91,27 +142,22 @@ class ChromeBridge:
         ]
         return any(Path(p).exists() for p in common) or shutil.which("google-chrome") is not None
 
-    # ---- balance check ---------------------------------------------------
+    # ---- balance check (crypto only — cards don't expose this) -------
 
     def query_metamask_balance_usdc(self) -> float | None:
-        """Best-effort read of the MetaMask USDC balance on the configured chain.
-
-        Real implementation walks the MetaMask extension's storage via CDP. We
-        return None when Chrome isn't running rather than crashing, so the CLI
-        can still show spending data without a live browser.
-        """
         if _env_flag("KYA_BROKER_DRY_RUN"):
             return float(_env_num("KYA_BROKER_DRY_RUN_BALANCE", 123.45))
         if not self._cdp_reachable():
             raise ChromeUnavailableError("Chrome CDP port unreachable")
-        # Implementation deferred to M3 hardening; return None so check_balance
-        # displays "balance unknown" instead of crashing.
-        return None
+        return None  # production impl deferred to M3 hardening
 
-    # ---- playbook execution ---------------------------------------------
+    # ---- playbook execution -----------------------------------------
 
     async def run_playbook(
-        self, playbook_name: str, intent: Intent, merchant: Any
+        self,
+        playbook_name: str,
+        intent: Intent,
+        merchant: MerchantConfig,
     ) -> PlaybookResult:
         if _env_flag("KYA_BROKER_DRY_RUN"):
             return await self._run_dry_run(playbook_name, intent)
@@ -129,27 +175,21 @@ class ChromeBridge:
         with path.open("r", encoding="utf-8") as f:
             pb = yaml.safe_load(f)
 
-        return await self._run_cdp(pb, intent)
+        pb = _render_template(pb, intent, merchant)
+        return await self._run_cdp(pb, intent, merchant)
 
-    # ---- dry-run simulator ----------------------------------------------
+    # ---- dry-run simulator -------------------------------------------
 
     async def _run_dry_run(self, playbook_name: str, intent: Intent) -> PlaybookResult:
-        """Deterministic simulator used in tests and setup smoke-tests.
-
-        Behaviour driven by env vars:
-            KYA_BROKER_DRY_RUN_OUTCOME = settled | user_declined | failed | timeout
-            KYA_BROKER_DRY_RUN_DELAY_S = fake latency
-        """
+        """Deterministic simulator used in tests and the setup smoke test."""
         outcome = _env("KYA_BROKER_DRY_RUN_OUTCOME", "settled")
         delay = _env_num("KYA_BROKER_DRY_RUN_DELAY_S", 0.1)
         await asyncio.sleep(delay)
 
         if outcome == "user_declined":
             return PlaybookResult(state="user_declined", error="user declined (dry-run)")
-        if outcome == "failed":
-            return PlaybookResult(state="failed", error="simulated failure")
-        if outcome == "timeout":
-            return PlaybookResult(state="failed", error="simulated timeout")
+        if outcome in {"failed", "timeout"}:
+            return PlaybookResult(state="failed", error=f"simulated {outcome}")
 
         fake_hash = f"0xdr{int(time.time())}{intent.intent_id[:6]}"
         return PlaybookResult(
@@ -159,19 +199,11 @@ class ChromeBridge:
             actual_cost_usd=intent.amount_usd,
         )
 
-    # ---- CDP backend -----------------------------------------------------
+    # ---- CDP backend -------------------------------------------------
 
-    async def _run_cdp(self, pb: dict[str, Any], intent: Intent) -> PlaybookResult:
-        """Execute a playbook over a CDP-connected Chrome instance.
-
-        This is the production path. It's structured so each playbook step maps
-        to an awaitable helper below. We intentionally keep it straight-line and
-        linear; complex branching belongs in the playbook YAML, not here.
-        """
-        steps = pb.get("steps", [])
-        preconditions = pb.get("preconditions", [])
-
-        # Import lazily so the module loads fine without pychrome installed.
+    async def _run_cdp(
+        self, pb: dict[str, Any], intent: Intent, merchant: MerchantConfig
+    ) -> PlaybookResult:
         try:
             import pychrome  # type: ignore
         except ImportError as e:
@@ -183,17 +215,17 @@ class ChromeBridge:
         tab = browser.new_tab()
         tab.start()
 
+        step: dict[str, Any] = {}
         try:
             tab.Page.enable()
             tab.Runtime.enable()
             tab.DOM.enable()
 
-            for step in steps:
-                result = await self._execute_step(tab, step, intent)
+            for step in pb.get("steps", []):
+                result = await self._execute_step(tab, step, intent, merchant)
                 if result is not None:
                     return result
 
-            # If the playbook didn't explicitly emit a terminal state, treat as settled.
             return PlaybookResult(state="settled")
 
         except Exception as e:  # noqa: BLE001
@@ -207,106 +239,186 @@ class ChromeBridge:
                 browser.close_tab(tab)
 
     async def _execute_step(
-        self, tab: Any, step: dict[str, Any], intent: Intent
+        self,
+        tab: Any,
+        step: dict[str, Any],
+        intent: Intent,
+        merchant: MerchantConfig,
     ) -> PlaybookResult | None:
-        """Execute a single playbook step. Return a PlaybookResult to short-circuit, or None."""
+        """Dispatch a single playbook step. Return PlaybookResult to short-circuit, or None."""
         if "goto" in step:
             tab.Page.navigate(url=step["goto"])
             await asyncio.sleep(1.0)
             return None
 
         if "click_visual" in step:
-            # Best-effort: find by text via document.evaluate — the production
-            # implementation would use Claude-in-Chrome's visual click tool here.
             label = step["click_visual"]
             js = (
-                "const xp=`//*[contains(text(),\"{label}\")]`;"
-                "const r=document.evaluate(xp,document,null,9,null).singleNodeValue;"
-                "if(r){{r.click();return true}}return false"
+                'const xp=`//*[contains(normalize-space(text()),"{label}")]`;'
+                'const r=document.evaluate(xp,document,null,9,null).singleNodeValue;'
+                'if(r){{r.click();return true}}return false'
             ).format(label=label.replace('"', '\\"'))
             tab.Runtime.evaluate(expression=js)
             await asyncio.sleep(0.5)
             return None
 
-        if "select_amount" in step:
-            amount_str = step["select_amount"].lstrip("$")
+        if "fill_amount" in step or "select_amount" in step:
+            amount_str = str(step.get("fill_amount") or step.get("select_amount", "")).lstrip("$")
             js = (
-                f'const i=document.querySelector("input[name*=amount],input[type=number]");'
-                f'if(i){{i.value="{amount_str}";i.dispatchEvent(new Event("input",{{bubbles:true}}));}}'
+                'const i=document.querySelector("input[name*=amount],'
+                'input[aria-label*=amount i],input[type=number]");'
+                f'if(i){{i.focus();i.value="{amount_str}";'
+                'i.dispatchEvent(new Event("input",{bubbles:true}));'
+                'i.dispatchEvent(new Event("change",{bubbles:true}));}}'
             )
             tab.Runtime.evaluate(expression=js)
             await asyncio.sleep(0.3)
             return None
 
-        if "wait_for_metamask_popup" in step:
-            timeout = int(step["wait_for_metamask_popup"].get("timeout", "300s").rstrip("s"))
-            result = await self._wait_metamask(tab, timeout)
-            if result.state != "settled":
-                return result
+        if "select_payment_method" in step:
+            # Click an element labeled with the method name (e.g. "Card", "Crypto", "MetaMask")
+            label = step["select_payment_method"]
+            js = (
+                'const xp=`//*[self::button or self::a or self::div or self::label]'
+                '[contains(normalize-space(.),"{label}")]`;'
+                'const r=document.evaluate(xp,document,null,9,null).singleNodeValue;'
+                'if(r){{r.click();return true}}return false'
+            ).format(label=label.replace('"', '\\"'))
+            tab.Runtime.evaluate(expression=js)
+            await asyncio.sleep(0.5)
             return None
 
+        if "wait_for" in step:
+            # Basic wait: either a duration or a selector-to-appear.
+            what = step["wait_for"]
+            if isinstance(what, dict) and "selector" in what:
+                timeout = int(what.get("timeout_s", 20))
+                deadline = time.time() + timeout
+                pred = build_selector_predicate(tab, what["selector"], exists=True)
+                while time.time() < deadline:
+                    if await pred():
+                        return None
+                    await asyncio.sleep(0.5)
+                return PlaybookResult(
+                    state="failed",
+                    error=f"wait_for selector {what['selector']!r} never appeared",
+                )
+            await asyncio.sleep(1.0)
+            return None
+
+        if "wait_for_human" in step:
+            return await self._handle_human_gate(tab, step["wait_for_human"], intent, merchant)
+
+        # Legacy alias from v0.3.1 — collapse to wait_for_human with metamask reason.
+        if "wait_for_metamask_popup" in step:
+            legacy = dict(step["wait_for_metamask_popup"] or {})
+            legacy.setdefault("reason", "metamask_sign")
+            legacy.setdefault("timeout", legacy.get("timeout", "300s"))
+            return await self._handle_human_gate(tab, legacy, intent, merchant)
+
         if "wait_for_merchant_settlement" in step:
-            timeout = int(step["wait_for_merchant_settlement"].get("timeout", "300s").rstrip("s"))
+            timeout = _parse_seconds(step["wait_for_merchant_settlement"].get("timeout", "300s"))
             pattern = step["wait_for_merchant_settlement"].get("expected_amount", "")
             settled = await self._wait_settlement(tab, pattern, timeout)
             if not settled:
                 return PlaybookResult(state="failed", error="merchant settlement timeout")
             return None
 
-        if "wait_for" in step:
-            await asyncio.sleep(1.0)  # placeholder; production uses DOM polling
+        if "record_outcome" in step:
+            # No-op — execution records are written by the broker based on the final result.
             return None
 
-        # Unknown step types just log and continue
         logger.info("chrome: skipping unrecognised step %r", step)
         return None
 
-    async def _wait_metamask(self, tab: Any, timeout: int) -> PlaybookResult:
-        """Poll for the MetaMask extension popup, then for user decision.
+    async def _handle_human_gate(
+        self,
+        tab: Any,
+        spec: dict[str, Any],
+        intent: Intent,
+        merchant: MerchantConfig,
+    ) -> PlaybookResult | None:
+        reason = HumanGateReason(spec.get("reason", "generic"))
+        prompt = spec.get("prompt") or default_human_prompt(reason, intent.amount_usd, merchant.name)
+        timeout_s = _parse_seconds(spec.get("timeout", self.cfg.human_gate_timeout_s))
 
-        The popup is a separate Chrome window; CDP lists it in targets/Page.
-        We don't click anything inside it — we just detect when it closes and
-        whether the preceding page shows 'signed' vs 'rejected' indicators.
-        """
-        deadline = time.time() + timeout
-        popup_seen = False
-        while time.time() < deadline:
-            result = tab.Runtime.evaluate(
-                expression=(
-                    '(()=>{'
-                    'const t=document.body?document.body.innerText:"";'
-                    'return JSON.stringify({'
-                    ' declined:/(reject|declined|cancel|denied)/i.test(t),'
-                    ' signed:/(confirmed|success|signed|payment received)/i.test(t)'
-                    '})'
-                    '})()'
-                )
+        completion_words = list(
+            spec.get("detect_completion_keywords")
+            or DEFAULT_COMPLETION_KEYWORDS.get(reason, [])
+        )
+        decline_words = list(
+            spec.get("detect_decline_keywords")
+            or DEFAULT_DECLINE_KEYWORDS.get(reason, [])
+        )
+
+        predicates = []
+        if "detect_completion_url" in spec:
+            predicates.append(build_url_predicate(tab, spec["detect_completion_url"]))
+        if "detect_completion_selector" in spec:
+            predicates.append(
+                build_selector_predicate(tab, spec["detect_completion_selector"], exists=True)
             )
-            try:
-                raw = result.get("result", {}).get("value", "{}")
-                data = json.loads(raw) if isinstance(raw, str) else {}
-            except (ValueError, TypeError):
-                data = {}
-            if data.get("declined"):
-                return PlaybookResult(state="user_declined", error="user declined in MetaMask")
-            if data.get("signed"):
-                return PlaybookResult(state="settled")
-            await asyncio.sleep(1.0)
-            popup_seen = True
+        if completion_words:
+            predicates.append(build_page_text_predicate(tab, completion_words))
 
-        err = "metamask popup never showed" if not popup_seen else "timeout waiting for signature"
-        return PlaybookResult(state="failed", error=err)
+        async def on_completion() -> bool:
+            for p in predicates:
+                if await p():
+                    return True
+            return False
+
+        decline_predicates = []
+        if "detect_decline_selector" in spec:
+            decline_predicates.append(
+                build_selector_predicate(tab, spec["detect_decline_selector"], exists=True)
+            )
+        if decline_words:
+            decline_predicates.append(build_page_text_predicate(tab, decline_words))
+
+        async def on_decline() -> bool:
+            for p in decline_predicates:
+                if await p():
+                    return True
+            return False
+
+        presence_check = None
+        optional = bool(spec.get("optional", False))
+        if optional and "presence_selector" in spec:
+            presence_check = build_selector_predicate(tab, spec["presence_selector"], exists=True)
+        elif optional and "presence_keywords" in spec:
+            presence_check = build_page_text_predicate(tab, list(spec["presence_keywords"]))
+
+        request = HumanGateRequest(
+            reason=reason,
+            prompt=prompt,
+            timeout_seconds=timeout_s,
+            on_completion=on_completion if predicates else None,
+            on_decline=on_decline if decline_predicates else None,
+            optional=optional,
+            presence_check=presence_check,
+        )
+        result = await self._human_gate.wait_for_human(request)
+
+        if result.outcome == HumanGateOutcome.DECLINED:
+            return PlaybookResult(state="user_declined", error=f"user declined at {reason.value}")
+        if result.outcome == HumanGateOutcome.TIMEOUT:
+            return PlaybookResult(
+                state="failed", error=f"human gate {reason.value} timed out after {timeout_s}s"
+            )
+        # COMPLETED or SKIPPED both continue the playbook.
+        return None
 
     async def _wait_settlement(self, tab: Any, pattern: str, timeout: int) -> bool:
         deadline = time.time() + timeout
+        positive = ["credit added", "payment received", "settled", "balance updated"]
         while time.time() < deadline:
             res = tab.Runtime.evaluate(
                 expression='document.body?document.body.innerText:""'
             )
-            text = res.get("result", {}).get("value", "") or ""
-            if pattern and pattern in text:
+            text = (res.get("result", {}).get("value") or "").lower()
+            if pattern and pattern.lower() in text:
                 return True
-            if any(kw in text.lower() for kw in ("credit added", "payment received", "settled")):
+            if any(kw in text for kw in positive):
                 return True
             await asyncio.sleep(2.0)
         return False
@@ -324,8 +436,6 @@ class ChromeBridge:
             pass
         try:
             screenshot = tab.Page.captureScreenshot()
-            import base64
-
             png_b64 = screenshot.get("data", "")
             if png_b64:
                 (out_dir / "screenshot.png").write_bytes(base64.b64decode(png_b64))
@@ -335,18 +445,25 @@ class ChromeBridge:
         return out_dir
 
 
-# ---- small utils -----------------------------------------------------------
+# --------------------------------------------------------------------------
+
+
+def _parse_seconds(value: Any) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip().lower()
+    if s.endswith("s"):
+        s = s[:-1]
+    if s.endswith("m"):
+        return int(float(s[:-1]) * 60)
+    return int(float(s))
 
 
 def _env(key: str, default: str) -> str:
-    import os
-
     return os.environ.get(key, default)
 
 
 def _env_num(key: str, default: float) -> float:
-    import os
-
     try:
         return float(os.environ.get(key, default))
     except (TypeError, ValueError):
@@ -354,8 +471,6 @@ def _env_num(key: str, default: float) -> float:
 
 
 def _env_flag(key: str) -> bool:
-    import os
-
     return os.environ.get(key, "").lower() in {"1", "true", "yes", "on"}
 
 

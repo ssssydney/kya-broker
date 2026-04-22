@@ -1,90 +1,119 @@
 ---
 name: kya-broker
-description: Autonomous payment skill for research workflows. Triggers when user wants Claude Code to run GPU experiments on vast.ai or similar platforms, and allows Claude Code to autonomously top up credits via user's MetaMask wallet. Only triggers when user explicitly mentions running an experiment, needing GPU compute, reproducing a paper on GPUs, or paying a cloud merchant. Do NOT trigger for general coding questions, local testing, or when an instance is already provisioned.
+description: Generic agent-payment skill. Triggers when the user wants Claude Code to autonomously pay a merchant (OpenRouter API credits, vast.ai GPU rental, Anthropic credits, and similar) using the user's own credit card, crypto wallet, or email-authorised account. Trigger only when the user explicitly asks to top up / buy credits / run a paid job on an allowlisted merchant. Do NOT trigger for general coding questions, local experiments, or unrelated spending requests.
 ---
 
-# KYA Broker — Agent Payment Skill
+# KYA Broker — Agent Payment Skill (v0.4)
 
-You help the user run paid compute workflows on vast.ai and similar GPU-rental merchants. When the workflow needs credit that the user doesn't currently have, you use this skill's CLI to propose a payment intent; an independent auditor (Codex by default) reviews it; and the final authorization happens in the user's MetaMask browser extension — you never see the private key and cannot bypass that step.
+A generic broker that lets the agent pay any allowlisted merchant using the
+user's human payment methods. You propose an intent; an independent auditor
+reviews it; the broker drives Chrome to the merchant's checkout; when the flow
+hits a moment only a human can complete (card entry, 3D-Secure, OTP, magic-link
+click, MetaMask signature), the broker surfaces that moment clearly and waits.
+You never touch card numbers, passwords, or private keys.
 
 ## When to use this skill
 
 Use it when the user asks you to:
 
-- Reproduce a paper / run an experiment / train a model that needs GPUs and no instance is already running
-- Set up cloud compute that requires paid credit
-- Delegate a paid task to an agent pipeline (topup + launch + SSH + run)
+- Top up OpenRouter / Anthropic / other LLM-API credits so you can keep using them
+- Top up vast.ai / Lambda / RunPod GPU credits for an experiment
+- Run an end-to-end paid workflow (topup + use) without the user babysitting every step
 
 Do NOT use it when:
 
-- The user is asking a general coding / research / reading question
-- An instance is already provisioned and has credit
-- The merchant is not in `policy.yaml`'s allowlist (ask the user before adding one)
+- The user is just asking a question; no payment is implied
+- The merchant is not in `config.yaml` → merchants
+- Existing balance is enough for the task (check `broker check-balance` first)
+
+## The generic pattern
+
+Every rail (card, crypto, email_link) reduces to the same shape:
+
+1. Broker drives Chrome to the merchant's checkout page
+2. Broker fills the amount + picks the method
+3. **Human gate** fires — broker surfaces a clear prompt ("enter card in the tab",
+   "sign in MetaMask", "check your email"), waits up to N seconds
+4. User completes the step in the browser (or their email / phone / wallet)
+5. Broker detects completion via page text / URL / selector signals
+6. Merchant settles; broker records the receipt
+
+Authorization tiers map to this:
+
+| Tier | Amount | Who approves |
+|---|---|---|
+| L0 | ≤ `l0_ceiling_usd` | Audit approves → auto-proceed. Card/crypto rails still require a human gate for card/wallet interaction. |
+| L1 | ≤ `l1_ceiling_usd` | Audit approves + explicit human gate |
+| L2 | > `l1_ceiling_usd` | Broker refuses. Ask the user before submitting. |
 
 ## Workflow
 
-1. **Read the request.** Pull out: the paper / code / experiment spec, dataset size, expected duration, any GPU preferences.
-2. **Estimate the job.** How many GPUs, which class (A100 / H100 / 4090), how many hours end-to-end. Estimate the vast.ai dollar cost with a small buffer (15-25%).
-3. **Check balance.** Run `broker check-balance`. If vast credit already covers the job, skip to step 6.
-4. **Propose intent.** Call `broker propose-intent` with a JSON payload (schema below). The broker will:
-   - Validate against `policy.yaml` thresholds
-   - Run audit (Codex, Claude, or both per user config)
-   - If ≤ L0 ceiling and audit approves: auto-execute via Chrome automation
-   - If L0 < amount ≤ L1 ceiling: audit must approve, then MetaMask popup asks the user to sign
-   - If amount > L1 ceiling: broker halts and asks you to surface the intent to the user yourself
-5. **Wait for settlement.** Watch `broker status <intent_id>` until state is `settled` or `failed`. Typical crypto topup settles in 30-120 seconds after user signs.
-6. **Launch + run.** Use the returned vast.ai credentials / instance info to SSH in and execute the experiment.
-
-Never ask the user to manually copy-paste payment details into a webpage — that defeats the purpose of the skill. Never suggest the user open vast.ai themselves to top up. Always go through `broker propose-intent`.
+1. **Read the user's request.** Pull out: the merchant, what they want to buy,
+   rough budget.
+2. **Check balance.** `broker check-balance`. If merchant credit already covers
+   the task, skip to use.
+3. **Propose intent.** Call `broker propose-intent` with a JSON payload (schema
+   below). Include `rail_hint` when you have a preference (e.g. card for OpenRouter).
+4. **Watch state.** The broker may auto-execute (L0) or return `awaiting_user`
+   (L1). In both cases a human-gate moment happens in the browser.
+5. **Resume after human action.** For `awaiting_user` you call
+   `broker resume <intent_id>` once the user says they've signed / entered
+   card / clicked the magic link; for L0, the broker polls automatically.
+6. **Use the credit.** Make the API calls, run the job — whatever the user
+   originally asked for.
 
 ## CLI reference
 
-- `broker propose-intent <path-to-intent.json>` — submit a payment intent. Prints intent_id and initial state.
-- `broker status <intent_id>` — poll the state machine. States: `proposed → audited → awaiting_user → executing → settled | failed | user_declined | playbook_broken`.
-- `broker check-balance` — MetaMask USDC balance on configured chain + vast.ai current credit + today's / this-month's spend.
-- `broker get-history [--limit N] [--format json]` — recent intents and outcomes.
-- `broker analyze-audits [--since DATE]` — only when shadow_mode is enabled; dumps Codex-vs-Claude verdict comparison.
+- `broker propose-intent <intent.json> [--context-file <ctx.json>]` — submit intent
+- `broker status <intent_id>` — state machine + audits + execution
+- `broker check-balance` — merchant credit + spending caps (crypto wallet balance when Chrome is attached)
+- `broker history [--limit N] [--format pretty|json]` — recent intents
+- `broker resume <intent_id>` — continue past an awaiting_user gate
+- `broker analyze-audits [--since YYYY-MM-DD]` — Codex vs Claude verdict A/B (shadow mode only)
 
-All commands also speak MCP when the broker is registered as an MCP server; the tool names map 1:1 (`propose_intent`, `check_balance`, `get_history`, `get_status`).
+MCP tool names map 1:1: `propose_intent`, `get_status`, `get_history`, `check_balance`.
 
-## Intent schema (v1.0)
+## Intent schema (v1.1)
 
 ```json
 {
-  "intent_id": "uuid-v4 — OMIT, broker fills in",
-  "merchant": "vast.ai",
-  "amount_usd": 10.00,
-  "rationale": "Running 2h attention-sink ablation on 2x H100 per Xiao et al. 2023 Table 3 setup",
-  "references": ["papers/attention-sink.pdf", "scripts/run_ablation.py"],
-  "estimated_actual_cost_usd": 8.50
+  "merchant": "openrouter.ai",
+  "amount_usd": 10.0,
+  "rationale": "Need $10 of openrouter credits to call gpt-4o-mini for the paper-reproduction pipeline (~5 runs * 2M tokens @ $0.60/M = $6, with 40% buffer).",
+  "estimated_actual_cost_usd": 6.0,
+  "references": ["scripts/run_pipeline.py"],
+  "rail_hint": "card"
 }
 ```
 
-The auditor reads `rationale` and `references` and cross-checks them against your recent conversation context. Prompt-injection attempts on your context will be visible to the auditor as rationale/context mismatch, which triggers a reject.
+`rail_hint` is optional; omit it to let the broker pick from config preferences.
+Valid values: `card`, `crypto`, `email_link`, `bank_transfer`.
 
 ## Hard rules
 
-- Never generate an intent with `amount_usd > policy.l1_ceiling_usd` without explicitly asking the user first; the broker will refuse anyway but it wastes a round-trip.
-- Never put credentials (API keys, wallet seeds) into intent `rationale` or `references` — those fields are sent to the auditor, not secret.
-- Never retry a `user_declined` intent silently — the user said no; ask them why before proposing again.
-- Never suggest the user disable audit or raise thresholds mid-workflow. If a legit experiment needs more money, bring it up as a separate decision before starting work.
-- If `broker status` returns `playbook_broken`, stop. Do NOT attempt to complete the payment through some other path. Tell the user and wait for them.
+- Never propose an intent with `amount_usd > policy.l1_ceiling_usd` without
+  asking the user first.
+- Never put secrets (API keys, wallet seeds, card numbers) anywhere in the
+  intent — they are forwarded to the auditor.
+- Never suggest the user disable audit, raise thresholds mid-workflow, or skip
+  the human gate — if a legit task needs more money, surface that to the user
+  as its own decision.
+- If `broker status` returns `playbook_broken` or `failed`, stop and tell the
+  user. Do not try to complete the payment manually through another path.
+- Never retry a `user_declined` intent silently. Ask the user why, adjust, try again.
 
-## Example: reproducing a paper
+## Example: topping up OpenRouter credits
 
-User: "Reproduce the attention-sink finding from this paper."
+```text
+User: "Run the paper-reproduction pipeline."
 
-1. You: Read paper, see it uses 2 × H100 for ~4h. Estimate $12-16.
-2. You: `broker check-balance` → vast credit $1.20. Need topup.
-3. You: Write `intent.json` with `amount_usd: 15.00`, `rationale` citing paper Table 3, `references: ["paper.pdf"]`.
-4. You: `broker propose-intent intent.json` → returns `intent_id=abc-123`, state=`audited` (approved), state advances to `awaiting_user`.
-5. User sees MetaMask popup in Chrome, reviews amount + recipient, signs.
-6. You: poll `broker status abc-123` until `settled`.
-7. You: SSH to returned vast instance, `git clone`, run, report results.
-
-## Failure modes to recognize
-
-- `state=user_declined` — user rejected in MetaMask. Do not retry; ask them first.
-- `state=playbook_broken` — vast UI changed or MetaMask popup didn't appear. Dump is in `kya-broker.local/dumps/`. Surface to user.
-- `state=failed` with `reason=rail_unavailable` — try a different rail if user has configured one; else report and stop.
-- Audit rejected with concern "rationale mismatch" — your rationale didn't match context. Re-read the conversation, don't just paraphrase the intent differently.
+You: Need ~$6 of OpenRouter credits. `broker check-balance` → current credit $0.12.
+    Propose intent: {merchant: openrouter.ai, amount_usd: 10, rail_hint: card,
+                      rationale: "5 runs * 2M tokens @ $0.60/M + buffer"}
+    Auditor approves. Broker drives Chrome to openrouter.ai/credits.
+    Human gate fires: "Enter your card in the Stripe iframe."
+    User autofills from 1Password, clicks Pay.
+    Broker sees 3DS challenge → second human gate. User completes.
+    Broker sees balance updated → settles intent.
+    You: proceed to run the pipeline against OpenRouter.
+```

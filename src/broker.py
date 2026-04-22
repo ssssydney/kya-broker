@@ -61,7 +61,7 @@ class Broker:
     ):
         self.cfg = config or load_config()
         self.ledger = ledger or Ledger()
-        self.chrome = chrome or ChromeBridge(self.cfg.chrome)
+        self.chrome = chrome or ChromeBridge(self.cfg.chrome, self.cfg.notifications)
         self.audit = AuditRunner(self.cfg, self.ledger)
 
     # ---- submission -------------------------------------------------------
@@ -178,7 +178,7 @@ class Broker:
             self.ledger.transition(
                 intent.intent_id,
                 IntentState.AWAITING_USER,
-                reason="L1 intent: MetaMask popup needed",
+                reason="L1 intent: human gate will fire during execution",
             )
             return BrokerResponse(
                 intent_id=intent.intent_id,
@@ -186,11 +186,12 @@ class Broker:
                 tier=tier,
                 verdict=verdict.verdict,
                 concerns=verdict.concerns,
-                next_action="wait_for_metamask_popup",
+                next_action="wait_for_human_gate",
                 message=(
-                    "Intent approved by auditor. Open Chrome: a MetaMask popup will ask "
-                    "you to sign. Call `broker resume <intent_id>` after you sign, or the "
-                    "broker will poll automatically if running in attached mode."
+                    "Intent approved by auditor. Call `broker resume <intent_id>` to drive "
+                    "Chrome to the merchant's checkout; a human gate will fire (enter card, "
+                    "sign in MetaMask, click magic link — depends on the chosen rail). The "
+                    "broker will surface that prompt in the terminal when it fires."
                 ),
             )
 
@@ -415,6 +416,7 @@ class Broker:
                 "rationale": row["rationale"],
                 "estimated_actual_cost_usd": row["estimated_actual_cost_usd"],
                 "references": json.loads(row["references_json"] or "[]"),
+                "rail_hint": row.get("rail_hint"),
                 "issuer_session": row["issuer_session"],
                 "created_at": row["created_at"],
                 "expires_at": row["expires_at"],

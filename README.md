@@ -1,13 +1,14 @@
 # KYA-Broker
 
-**An autonomous payment skill for Claude Code.** Clone it into `~/.claude/skills/`, run one setup wizard, and your Claude Code can handle the whole "top up vast.ai → launch a GPU box → reproduce the paper" loop on its own. It never sees your wallet password — final signatures stay inside your MetaMask browser extension.
+**A generic agent-payment skill for Claude Code.** Clone it into `~/.claude/skills/`, run one setup wizard, and your Claude Code can top up whatever merchant you allowlist — **OpenRouter, vast.ai, Anthropic, and anything else with a playbook** — using your existing human payment methods (credit card, MetaMask, email-authorised accounts). The skill drives the browser up to the card / wallet / OTP step, then hands over and waits. It never sees card numbers, passwords, or private keys.
 
-- ✦ **Portable.** Any macOS or Linux box with Python 3.11+, Chrome, and MetaMask can install the skill. No per-user server, no device-bound keys.
-- ✦ **Safe by default.** Every intent is cross-audited by Codex (or Claude, or both) before a dollar moves. Large intents trigger a native MetaMask popup — auto-clicking Confirm is a deliberate non-feature.
-- ✦ **Observable.** SQLite ledger with full state history, audit verdicts, and tx hashes. Export to JSON for analysis with `broker export-logs`.
-- ✦ **Research-ready.** Shadow mode runs Codex and Claude in parallel on the same intent so you can collect A/B verdict data from real usage.
+- ✦ **Rail-agnostic.** Credit card (Stripe / Chrome autofill / 1Password / Apple Pay), crypto (MetaMask USDC), email magic links, 3D-Secure challenges, SMS OTP — all reduce to the same "HumanGate" primitive.
+- ✦ **Portable.** macOS / Linux + Python 3.11+ + Chrome. No per-user server, no device-bound keys.
+- ✦ **Safe by default.** Independent Codex auditor reviews every intent; cross-model-family audit hedges against Claude-auditing-Claude shared biases. Shadow mode runs Codex and Claude in parallel for A/B research.
+- ✦ **Observable.** SQLite ledger with full state history, audit verdicts, tx hashes and receipts. Export via `broker export-logs`.
+- ✦ **Research-ready.** Shadow mode gives you Codex-vs-Claude verdict data on real intents via `broker analyze-audits`.
 
-> **Status:** v0.3.1 — dual-auditor + MetaMask-native authorization. The intent lifecycle, ledger, auditor, and CLI/MCP surface are feature-complete; Chrome automation is in place with a dry-run simulator for development and a CDP backend for real runs. See [dev plan](docs/architecture.md) for milestones.
+> **Status:** v0.4 — generic payment rails. Previous v0.3.1 was MetaMask/vast-only; this release lifts the HumanGate abstraction to cover credit cards, 3DS, email links, and MetaMask uniformly. 51 tests passing.
 
 ## 5-minute quickstart
 
@@ -22,103 +23,140 @@ bash install.sh
 # 3. Make sure ~/.local/bin is on PATH
 export PATH="$HOME/.local/bin:$PATH"
 
-# 4. Run the wizard (audit layer, policy, vast.ai, funding)
+# 4. Run the wizard (audit layer, enroll methods, allowlist merchants, thresholds)
 broker setup
 
 # 5. Smoke-test
 broker check-balance
 ```
 
-Then in Claude Code, the `kya-broker` skill is auto-discovered (SKILL.md in the repo). When you ask Claude to reproduce a paper that needs GPUs, it'll call `broker propose-intent` on its own.
+The `kya-broker` skill auto-registers when the repo lives at `~/.claude/skills/kya-broker/` (Claude Code reads `SKILL.md`).
 
 ## Architecture at a glance
 
 ```
-┌──────────────────┐       propose_intent (MCP)        ┌─────────────────────┐
-│  Claude Code     │ ────────────────────────────────▶ │   broker (Python)   │
-│  (agent session) │                                    │  intent + ledger    │
-└──────────────────┘                                    └──────────┬──────────┘
-                                                                   │ audit
-                                                                   ▼
-                                                        ┌─────────────────────┐
-                                                        │ Codex (primary)     │  ← independent
-                                                        │ Claude (shadow/fb)  │    model family
-                                                        └──────────┬──────────┘
-                                                                   │ approved + L0/L1 gate
-                                                                   ▼
-                                                        ┌─────────────────────┐
-                                                        │ Chrome + MetaMask   │
-                                                        │  (user's browser)   │
-                                                        └──────────┬──────────┘
-                                                                   │ tx hash + receipt
-                                                                   ▼
-                                                        ┌─────────────────────┐
-                                                        │  vast.ai credit     │
-                                                        └─────────────────────┘
+┌──────────────────┐  propose_intent  ┌─────────────────────┐
+│  Claude Code     │ ───────────────▶ │   broker (Python)   │
+│  (agent session) │                  │  intent + ledger    │
+└──────────────────┘                  └──────────┬──────────┘
+                                                 │ audit
+                                                 ▼
+                                       ┌─────────────────────┐
+                                       │ Codex  (primary)    │ ← independent
+                                       │ Claude (shadow/fb)  │   model family
+                                       └──────────┬──────────┘
+                                                  │ approved + L0/L1 gate
+                                                  ▼
+                                       ┌─────────────────────┐
+                                       │ Chrome (user's)     │
+                                       │ ── navigate, fill   │
+                                       │ ── HumanGate ──────┐│
+                                       └──────────┬──────────┘│
+                                                  │           │
+                              (card / MetaMask / email / OTP) │
+                                                  │           │
+                                                  ◀───────────┘
+                                                  │ receipt + tx hash
+                                                  ▼
+                                       ┌─────────────────────┐
+                                       │ merchant credit +$N │
+                                       │  (OpenRouter / vast │
+                                       │   / Anthropic …)    │
+                                       └─────────────────────┘
 ```
-
-See [docs/architecture.md](docs/architecture.md) for the full narrative.
 
 ## CLI reference
 
 | Command | What it does |
 |---|---|
-| `broker setup` | Interactive first-run wizard (audit layer, vast.ai, funding, thresholds) |
-| `broker propose-intent intent.json` | Submit a payment intent (same semantics as the MCP tool) |
-| `broker status <intent_id>` | Poll state machine + audits + execution |
+| `broker setup` | Interactive wizard: audit, payment-method enrollment, merchant allowlist, thresholds |
+| `broker propose-intent intent.json [--context-file ctx.json]` | Submit an intent (same schema as the MCP tool) |
+| `broker status <intent_id>` | State machine + audits + execution + human-gate history |
+| `broker check-balance` | Spending caps + Chrome-attached wallet balance |
 | `broker history [--limit N] [--format pretty|json]` | Recent intents |
-| `broker check-balance` | MetaMask USDC + spending caps |
-| `broker resume <intent_id>` | Resume a L1 intent after the user signs in MetaMask |
-| `broker analyze-audits [--since YYYY-MM-DD] [--format pretty|json|csv]` | Codex-vs-Claude A/B comparison |
-| `broker export-logs out.json` | Dump the ledger for offline research |
+| `broker resume <intent_id>` | Resume after a human-gate in awaiting_user |
+| `broker analyze-audits [--since YYYY-MM-DD]` | Codex vs Claude verdicts (shadow mode) |
+| `broker export-logs out.json` | Dump the full ledger for offline research |
 
-## Configuring the audit layer
+## Payment methods
 
-In `~/.claude/skills/kya-broker.local/config.yaml`:
+Declared in `config.yaml`:
+
+```yaml
+payment_methods:
+  - name: "research visa"
+    rail: card
+    last4: "4242"
+    notes: "chrome autofill profile 'work'"
+    max_auto_execute_usd: 20.00
+
+  - name: "metamask main"
+    rail: crypto
+    wallet_address: "0xabc…def"
+    notes: "MetaMask · Polygon · USDC"
+
+  - name: "email magic-link"
+    rail: email_link
+    notes: "warrenzhong666@gmail.com"
+```
+
+The skill stores only labels / last-4 / wallet-address — never full card numbers or seeds. The actual fill / sign happens in the browser, out of the skill's reach.
+
+## Merchants shipped with defaults
+
+| Merchant | Rails | Playbook(s) |
+|---|---|---|
+| openrouter.ai | card, crypto | `openrouter_topup_card.yaml`, `openrouter_topup_crypto.yaml` |
+| vast.ai | crypto, card | `vast_topup_crypto.yaml`, `vast_topup_card.yaml` |
+| anthropic.com | card | `anthropic_topup_card.yaml` |
+
+Add your own with [docs/playbook_authoring.md](docs/playbook_authoring.md). Each new merchant is a YAML file + an entry in `config.yaml` → `merchants:`.
+
+## Audit layer
 
 ```yaml
 audit:
-  primary: codex | claude | auto   # auto = codex if available, else claude
-  shadow_mode: false               # true = run the other auditor in parallel (no veto)
+  primary: codex | claude | auto
+  shadow_mode: false
   fallback_on_primary_failure: false
   timeout_seconds: 30
 ```
 
-**Why Codex is the recommended primary.** A Claude-auditing-Claude pipeline shares training biases; the same jailbreak might slip past both. Codex (a GPT family model via OpenAI) is from a different model family, which is the cross-source-review equivalent of a second keypair on a multisig.
-
-**Shadow mode** runs both auditors on every intent but only the primary's verdict gates execution. This doubles your audit cost (~$0.004–$0.02/intent) but gives you two verdicts per intent for comparison via `broker analyze-audits`. Use this if you're researching multi-auditor effectiveness.
+Codex is recommended as primary because it's from a different model family than Claude Code; same-family audit (Claude audits Claude) shares training biases. Shadow mode runs both auditors on every intent and writes both verdicts to the ledger for A/B analysis.
 
 ## The L0 / L1 / L2 gate
 
 ```
-L0  amount <= l0_ceiling_usd  →  audit only, auto-execute on approve
-L1  amount <= l1_ceiling_usd  →  audit + native MetaMask popup, user signs
-L2  amount  > l1_ceiling_usd  →  broker refuses; you must approve out of band
+L0  amount ≤ l0_ceiling_usd  → audit only, auto-execute (rail gate still runs)
+L1  amount ≤ l1_ceiling_usd  → audit + explicit human gate (card/sign/OTP)
+L2  amount  > l1_ceiling_usd → broker refuses; ask human out of band
 ```
 
-`l0_ceiling_usd` and `l1_ceiling_usd` are in your config. Defaults are $2 and $50 respectively — tune to your risk tolerance.
+Note: even at L0, card / crypto / email_link rails always require a human gate at the rail level (you still have to type the CVV or sign the tx). L0 just means the broker doesn't block on an additional confirmation step beyond the rail's own.
 
 ## FAQ
 
-**Does this touch my MetaMask seed phrase?** No. The skill drives Chrome, which drives the MetaMask extension. You unlock MetaMask with your password; the skill never sees it and cannot sign on your behalf.
+**Does this store my credit card?** No. The card number is typed into the merchant's Stripe iframe by you (or autofilled from Chrome / 1Password / Apple Pay). The broker sees only last-4 / expiry via DOM inspection after payment, if at all.
 
-**What if vast.ai changes their UI?** The playbook (`playbooks/vast_topup_crypto.yaml`) captures every selector/step. When a step fails the broker dumps the DOM + screenshot to `~/.claude/skills/kya-broker.local/dumps/` and marks the intent `playbook_broken`. Fix is "update the YAML, PR" — no Python changes needed.
+**Does this touch my MetaMask seed phrase?** No. MetaMask unlocks with your password inside the extension; the broker never sees it.
 
-**Can I use this on two machines at once with the same wallet?** No — not safely. Two brokers signing with the same address will race. If you need multi-machine, use a different MetaMask account per machine.
+**What if a merchant adds 2FA mid-checkout?** Most flows (3DS, SMS OTP, email link) are already modeled as optional HumanGates. The broker detects them, fires a gate, waits. If you hit a novel gate we don't recognise, it'll timeout and mark `playbook_broken` — file a PR with a new `wait_for_human` step.
 
-**How do I uninstall?** `bash uninstall.sh` removes wrappers + venv. Your ledger, config, and `.env` stay in `~/.claude/skills/kya-broker.local/` — delete that folder if you also want to wipe history.
+**Can I use saved cards / Apple Pay / Google Pay?** Yes. The broker doesn't care how the card field gets filled — browser autofill, 1Password, Apple Pay, manual typing are all fine from its perspective. The completion detector just watches for success text.
 
-**Is this going to get my vast.ai account banned?** vast's ToS likely forbid bot-driven checkouts. At low volume (< 20 intents/month per account) this hasn't been observed, but assume the risk is real. The skill is not a good fit for high-throughput or commercial automation.
+**Can two machines share one card?** Yes, but be careful with duplicate charges. Each intent creates one charge at its own merchant; there's no shared state between machines, so don't auto-propose the same intent from two machines simultaneously.
+
+**Uninstall?** `bash uninstall.sh` removes wrappers. Ledger + config stay in `~/.claude/skills/kya-broker.local/` — delete that folder to wipe history.
 
 ## Development
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest tests/    # 48 tests, ~1s
+.venv/bin/python -m pytest tests/   # ~51 tests, ~1.5s
 ```
 
-Tests run in a tmpdir sandbox (see `tests/conftest.py`) and force `KYA_BROKER_DRY_RUN=1` so no real browser is needed.
+Tests run in a tmpdir sandbox (`tests/conftest.py`) and force `KYA_BROKER_DRY_RUN=1` — no browser, no real API calls.
 
 ## License
 

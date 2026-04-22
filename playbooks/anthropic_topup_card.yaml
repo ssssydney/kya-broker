@@ -1,0 +1,47 @@
+name: anthropic_topup_card
+description: Top up Anthropic API credits using a credit card.
+rail: card
+version: 1
+
+preconditions:
+  - "User is signed in at https://console.anthropic.com."
+  - "User is willing to enter a credit card (saved or manual)."
+
+steps:
+  - goto: "https://console.anthropic.com/settings/billing"
+
+  - wait_for_human:
+      reason: login
+      optional: true
+      presence_keywords: [sign in, log in, continue with google]
+      detect_completion_keywords: [billing, credits, add credits, usage]
+      timeout: 180s
+
+  - click_visual: "Add Credits"
+
+  - fill_amount: "${{ intent.amount_usd }}"
+
+  - wait_for_human:
+      reason: card_details
+      prompt: |
+        Anthropic's Stripe checkout is ready. Enter (or autofill) your card
+        and click Pay $${{ intent.amount_usd }}.
+      detect_completion_keywords: [payment successful, credits added, thank you]
+      detect_decline_keywords: [card declined, payment failed]
+      timeout: 240s
+
+  - wait_for_human:
+      reason: card_3ds
+      optional: true
+      presence_keywords: [verify your identity, 3d secure, authentication required]
+      detect_completion_keywords: [payment successful, verification successful]
+      detect_decline_keywords: [authentication failed]
+      timeout: 180s
+
+  - wait_for_merchant_settlement:
+      merchant: anthropic.com
+      expected_amount: "$${{ intent.amount_usd }}"
+      timeout: 120s
+
+  - record_outcome:
+      state: settled

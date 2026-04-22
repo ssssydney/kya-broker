@@ -1,163 +1,198 @@
 # Architecture
 
-KYA-Broker (Know-Your-Agent Broker) is a portable Claude Code skill that lets
-an agent autonomously pay merchants on behalf of the user, without ever holding
-the user's private keys or passwords. This document explains the pieces and
-why they're shaped the way they are.
+KYA-Broker (Know-Your-Agent Broker) is a Claude Code skill that lets the agent
+autonomously pay merchants on behalf of the user, without ever holding the
+user's private keys, card numbers, or passwords. This doc explains the pieces
+and the trade-offs.
 
-## Principal diagram
+## Principals
 
-Four principals and what each is responsible for:
+| Principal | Can do | Cannot do |
+|---|---|---|
+| Claude Code (agent) | propose intents, read ledger status | sign transactions, enter card numbers, move money |
+| Broker (this skill) | validate, persist, audit, drive Chrome up to the human gate | sign, type card data, bypass gates |
+| Auditor (Codex / Claude) | approve / reject intents, write verdicts | influence execution beyond the primary verdict |
+| Browser + human | sign in, enter cards, sign transactions, complete 3DS / OTP / magic links | propose intents, change policy |
 
-| Principal | Identity | Can do | Cannot do |
-|---|---|---|---|
-| Claude Code (agent) | user's local CC session | propose intents, read ledger status | sign transactions, move money |
-| Broker (this skill) | Python process | validate, persist, audit, drive Chrome | sign transactions, bypass MetaMask |
-| Auditor (Codex / Claude) | independent model-family | approve / reject intents, write verdicts | influence execution beyond primary verdict |
-| Browser + MetaMask | user's Chrome profile | sign transactions (with password) | propose intents, change policy |
+No single principal can move money without at least one human action at the
+rail's native authorization step.
 
-No principal has the full chain of capabilities required to move money without
-at least one human action. That's the core property the architecture preserves.
+## The HumanGate primitive
 
-## Data flow for one topup
+The biggest design shift in v0.4: every rail collapses to the same primitive.
 
+```python
+class HumanGateRequest:
+    reason: "metamask_sign" | "card_details" | "card_3ds" | "email_magic_link"
+          | "email_otp" | "sms_otp" | "login" | "saved_card_confirm" | "passkey" | "generic"
+    prompt: str                     # user-facing explanation
+    timeout_seconds: int
+    on_completion: predicate        # checks DOM / URL / selectors
+    on_decline: predicate
+    optional: bool                  # skip if presence_check says "not present"
+    presence_check: predicate
 ```
-agent                broker                 auditor              chrome+metamask         vast
-  │  propose_intent  │                         │                         │                │
-  │ ───────────────▶ │                         │                         │                │
-  │                  │── validate, tier ───────┤                         │                │
-  │                  │── audit ──────────────▶ │                         │                │
-  │                  │ ◀──── verdict ──────────┤                         │                │
-  │  state: audited  │                         │                         │                │
-  │ ◀──────────────  │                         │                         │                │
-  │                  │── run playbook ────────────────────────────────▶ │                │
-  │                  │                         │                         │── navigate ──▶ │
-  │                  │                         │                         │ ◀── page ───── │
-  │                  │                         │                         │── click,etc.─▶ │
-  │                  │                         │                         │  [MetaMask     │
-  │                  │                         │                         │   popup]       │
-  │                  │                         │                         │ user signs     │
-  │                  │                         │                         │── tx ────────▶ │
-  │                  │                         │                         │ ◀──settled──── │
-  │                  │ ◀── tx hash, receipt ──────────────────────────── │                │
-  │  state: settled  │                         │                         │                │
-  │ ◀──────────────  │                         │                         │                │
+
+The broker calls `human_gate.wait_for_human(request)` and gets back
+`completed | declined | timeout | skipped`. Notification channels (terminal
+panel, macOS banner, say-aloud, custom callable) are pluggable.
+
+Every playbook step of the form `wait_for_human:` becomes one `HumanGateRequest`. The legacy `wait_for_metamask_popup` step from v0.3.1 is a thin alias.
+
+## Playbook model
+
+A playbook is a YAML file that drives Chrome through a specific merchant × rail combination. For example, OpenRouter card vs OpenRouter crypto are two different files. The playbook schema:
+
+```yaml
+name: openrouter_topup_card
+rail: card
+
+preconditions:
+  - human-readable assertion
+
+steps:
+  - goto: <url>                   # navigate
+  - wait_for: <description>       # placeholder sleep / DOM wait
+  - click_visual: <label>         # click element by visible text
+  - fill_amount: <usd>            # set amount input
+  - select_payment_method: <name> # click method radio / button
+  - wait_for_human:               # HumanGate — see above
+      reason: <reason>
+      prompt: <prompt>
+      detect_completion_keywords: [...]
+      detect_decline_keywords: [...]
+      timeout: 240s
+      optional: false
+      presence_keywords: [...]    # only used when optional=true
+  - wait_for_merchant_settlement: # poll until balance updates
+      expected_amount: "$N"
+      timeout: 300s
+  - record_outcome:
+      state: settled
 ```
+
+Template placeholders like `${{ intent.amount_usd }}` are interpolated from the
+Intent at execution time. Chrome-specific details (CSS selectors, XPath) are
+hidden behind the step types — the playbook stays merchant-level.
 
 ## Intent lifecycle
 
 ```
-        propose_intent
-            │
-            ▼
-       ┌────────┐   audit reject       ┌──────────┐
-       │proposed│──────────────────▶   │ rejected │
-       └────────┘                      └──────────┘
-            │ audit approve
-            ▼
-       ┌────────┐
-       │ audited│
-       └────────┘
-       │        │
-       │ L0     │ L1
-       ▼        ▼
-  ┌───────┐ ┌───────────────┐
-  │execute│ │ awaiting_user │
-  └───────┘ └───────────────┘
-       │         │ resume (user signed)
-       │         ▼
-       │    ┌───────┐
-       └──▶ │execute│
-            └───────┘
-             │   │   │   │
- settled ───┘    │   │   └── playbook_broken
-           user_declined  failed
+            propose_intent
+                │
+                ▼
+          ┌──────────┐   audit reject    ┌──────────┐
+          │ proposed │ ──────────────▶  │ rejected │
+          └──────────┘                  └──────────┘
+                │ audit approve
+                ▼
+          ┌──────────┐
+          │ audited  │
+          └──────────┘
+           │        │
+           │ L0     │ L1
+           ▼        ▼
+      ┌──────────┐ ┌──────────────┐
+      │ executing│ │awaiting_user │
+      └──────────┘ └──────────────┘
+                        │ resume (user confirmed)
+                        ▼
+                  ┌──────────┐
+                  │executing │
+                  └──────────┘
+                  │   │   │   │
+         settled  │  user_declined
+                  │   │
+                  │ failed / playbook_broken
 ```
 
 Terminal states: `settled`, `rejected`, `user_declined`, `failed`, `playbook_broken`, `expired`.
 
+## Rail selection
+
+`select_rail(cfg, intent)` walks candidates in this order:
+
+1. `intent.rail_hint` if set and the user has a matching enrolled method.
+2. Merchant's declared `preferred_rail`.
+3. `cfg.rails` (user-defined preference list), filtered to rails the user has enrolled AND the merchant has a playbook for.
+
+If none match, raises `RailUnavailableError` with a human-readable breakdown
+of why each candidate was rejected.
+
 ## Why dual auditor?
 
-Claude Code is a Claude agent. If Claude also audits Claude's intents, a single
-adversarial input — say, a prompt-injected PDF — has some chance of fooling both
-sides: they share training data, both follow similar instruction-following
-patterns, both may rationalize suspect arguments the same way.
+An agent that's vulnerable to prompt injection may also be able to fool an
+auditor drawn from the same model family. Codex (GPT family) and Claude
+(Anthropic family) are trained on overlapping but distinct corpora; using
+Codex as primary + Claude as shadow is the closest thing to a cross-source
+security review.
 
-Codex (GPT family) is trained by a different company on a different corpus.
-It's not perfect, but it's the closest thing available to an *independent* opinion.
-Using it as the primary auditor is like using two different hash functions in a
-security construction — a weakness in one doesn't automatically compromise the other.
+Shadow mode (`audit.shadow_mode: true`) runs both models on every intent for
+A/B data. `broker analyze-audits` computes per-intent verdict agreement and
+can export CSV for offline analysis.
 
-**Shadow mode** (`audit.shadow_mode: true`) runs both auditors on every intent
-but only the primary vetoes. This costs ~2x but produces a dataset: every intent
-now has verdicts from both models, and `broker analyze-audits` computes:
-- Agreement rate (how often Codex and Claude say the same thing)
-- Per-class disagreement (when they differ, which one is usually right on manual review)
-- Latency and cost deltas
+## Why the human gate is physically unbypassable
 
-This data is why we call v0.3.1 "research-ready" — without both auditors running
-side-by-side, we have no way to say whether the cross-model-family choice is actually
-buying safety or not.
+Earlier drafts had elaborate L0/L1/L2 passkey stacks. v0.3 retired those in
+favor of "whatever the rail already makes the human do":
 
-## Why MetaMask's native popup is the L2 gate
+- **Credit card:** Stripe's iframe is sandboxed and only accepts input from
+  the user's keyboard / autofill; the broker cannot type into it (cross-origin)
+  and cannot click Pay without the card being filled.
+- **3DS:** the bank's challenge frame is a second sandbox. Same story.
+- **MetaMask:** the extension popup is a browser-level UI outside the page's
+  scripting surface.
+- **Email magic-link:** the link goes to a URL only the user's inbox holds.
+  Even if the broker had read access to the inbox (it doesn't), the flow is
+  designed around the human clicking.
+- **SMS OTP:** the OTP is on a second device.
 
-Earlier drafts of this skill had an elaborate authorization stack (L0 auto, L1
-passkey, L2 hardware wallet). v0.3 retires that and relies on what's already
-there: **MetaMask refuses to sign without an unlocked extension, and unlocking
-requires the user's password (or a hardware wallet confirmation)**.
-
-The broker physically cannot bypass this:
-1. We don't know the password; it's hashed inside MetaMask's storage.
-2. We don't try to click Confirm in the popup — the prompt file `prompts/chrome_agent.md`
-   makes this a hard "never do" rule for any Chrome-driving agent.
-3. Even if a rogue agent ignored that rule, the OS-level frontmost-app and
-   extension-isolation model don't let web content drive the MetaMask popup's
-   buttons via scripting.
-
-What's lost: batching many small payments behind one user confirm. What's gained:
-every signature shows the user the real amount and recipient. For a skill whose
-failure mode is "agent pays too much," that's the right trade.
+In each case, the "attacker model" (a compromised or prompt-injected Claude Code) cannot complete the authorization. The broker presents the moment; the user (or no one) decides.
 
 ## File layout
 
 ```
 ~/.claude/skills/kya-broker/           # read-only, git-pullable
-├── SKILL.md                           # Claude Code reads this
-├── pyproject.toml
-├── install.sh / uninstall.sh
+├── SKILL.md
 ├── policy.default.yaml
-├── playbooks/*.yaml
-├── prompts/*.md
-└── src/                               # all Python
-    ├── intent.py                      # data model + state machine
-    ├── ledger.py                      # SQLite
-    ├── auditor/{base,codex,claude,runner}.py
-    ├── broker.py                      # orchestrator
-    ├── chrome_bridge.py               # CDP + dry-run
-    ├── mcp_server.py                  # stdio MCP
-    ├── cli.py                         # `broker` CLI
-    └── setup_wizard.py                # interactive first-run
+├── playbooks/
+│   ├── openrouter_topup_card.yaml
+│   ├── openrouter_topup_crypto.yaml
+│   ├── vast_topup_crypto.yaml
+│   ├── vast_topup_card.yaml
+│   └── anthropic_topup_card.yaml
+├── prompts/
+│   ├── audit_system.md
+│   ├── audit_codex.md
+│   ├── audit_claude.md
+│   └── chrome_agent.md
+└── src/
+    ├── intent.py              # data model + state machine (+ rail_hint)
+    ├── ledger.py              # SQLite, schema v3 adds rail_hint column
+    ├── auditor/…              # Codex + Claude + runner
+    ├── broker.py              # orchestrator
+    ├── chrome_bridge.py       # CDP + dry-run; speaks HumanGate
+    ├── human_gate.py          # HumanGate primitive + notifiers
+    ├── rail_selector.py       # now rail-agnostic
+    ├── config.py              # payment_methods, merchants.playbooks map
+    ├── mcp_server.py          # stdio MCP
+    ├── cli.py                 # `broker` CLI
+    └── setup_wizard.py        # interactive enrollment
 
 ~/.claude/skills/kya-broker.local/     # user state, never committed
 ├── ledger.sqlite
 ├── config.yaml
 ├── .env
-├── dumps/                             # DOM + screenshots on playbook failure
+├── dumps/       # DOM + screenshots on playbook failure
 └── logs/
 ```
 
-Separating read-only skill code from user state means `git pull` upgrades the
-skill without touching ledger or config. Uninstall is `rm -rf` on the skill dir.
+## What's NOT in v0.4
 
-## What's *not* in v0.3.1
-
-- Fiat rail (Stripe Issuing). Reserved for v0.4+; the rail_selector returns
-  `unavailable` for now.
-- Multi-machine coordination. Two brokers pointing at the same wallet can race
-  on nonces. Documented as "don't do that."
-- Anti-phishing on the user's Chrome profile. If the user installs a malicious
-  extension that imitates MetaMask, we can't help. setup.py reminds users to
-  use a clean profile.
-- Full Claude-in-Chrome MCP integration. The `chrome_bridge.py` has the CDP
-  backend scaffolded and a dry-run simulator for testing; wiring it to the
-  `claude-in-chrome` MCP tools is pending real-merchant validation.
+- Bank transfer (ACH / SEPA). Reserved for v0.5+.
+- Bulk / recurring topups without per-intent audit. The cost / benefit doesn't
+  favor auto-recurring for a skill that aims to surface every spend.
+- Multi-machine coordination with the same card / wallet. Doable but out of
+  scope; keep one broker per payment method.
+- Anti-phishing on the user's Chrome profile. If you install malicious
+  extensions, we can't protect you — setup reminds you to use a clean profile.

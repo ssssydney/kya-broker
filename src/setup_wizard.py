@@ -1,10 +1,10 @@
 """Interactive first-run wizard.
 
 Covers:
-  1. Prerequisites (Python, Chrome, MetaMask)
+  1. Prerequisites (Python, Chrome)
   2. Auditor selection (Codex, Claude, or both in shadow mode)
-  3. vast.ai login check
-  4. MetaMask funding check
+  3. Payment method enrollment (card / crypto / email-link)
+  4. Merchant allowlist review
   5. Policy thresholds
   6. Dry-run smoke test
 """
@@ -12,7 +12,6 @@ Covers:
 from __future__ import annotations
 
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -23,7 +22,13 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, FloatPrompt, Prompt
 
-from .config import Config, load_config, save_config
+from .config import (
+    Config,
+    MerchantConfig,
+    PaymentMethod,
+    load_config,
+    save_config,
+)
 from .ledger import init_ledger
 from .paths import default_policy_path, env_path, local_root
 
@@ -44,6 +49,9 @@ def warn(msg: str) -> None:
 
 def fail(msg: str) -> None:
     console.print(f"  [red]xx[/]  {msg}")
+
+
+# --------------------------------------------------------------------------
 
 
 def check_prereqs() -> bool:
@@ -67,35 +75,22 @@ def check_prereqs() -> bool:
     else:
         ok(f"Chrome at {chrome or shutil.which('google-chrome')}")
 
-    console.print()
-    console.print(
-        Panel.fit(
-            "Make sure MetaMask is installed in the Chrome profile you'll use with "
-            "this skill. It's the browser-extension wallet at https://metamask.io.\n\n"
-            "If you haven't installed it, do that now — the skill will drive a Chrome "
-            "window that assumes MetaMask is present.",
-            title="MetaMask",
-            border_style="cyan",
-        )
-    )
-    if not Confirm.ask("Do you have MetaMask installed in Chrome?", default=True):
-        warn("Please install MetaMask, then rerun `broker setup`.")
-        all_ok = False
-
     return all_ok
+
+
+# --------------------------------------------------------------------------
 
 
 def configure_auditor(cfg: Config) -> None:
     console.print(
         Panel.fit(
             "[bold]Auditor[/] is the second opinion that reviews every payment intent "
-            "before the broker spends money. Using Codex (OpenAI) is strongly recommended "
-            "— a Claude auditor reviewing a Claude Code agent shares training biases, "
-            "and some prompt injections that slip past one may slip past the other.\n\n"
-            "Option A: Codex (OpenAI)  — recommended primary\n"
-            "Option B: Claude (Anthropic) — fallback (same-family, weaker)\n"
-            "Option C: Both (shadow-mode research) — Codex decides, Claude runs in parallel",
-            title="Step 2 — Configure audit layer",
+            "before the broker spends money. Codex (OpenAI) is recommended because "
+            "Claude-auditing-Claude shares training biases.\n\n"
+            "A: Codex (OpenAI)    — recommended primary\n"
+            "B: Claude (Anthropic) — fallback (same-family, weaker)\n"
+            "C: Both (shadow mode) — Codex decides, Claude runs in parallel",
+            title="Audit layer",
             border_style="cyan",
         )
     )
@@ -105,17 +100,14 @@ def configure_auditor(cfg: Config) -> None:
     if choice in ("A", "C"):
         if not codex_ok:
             warn("`codex` CLI not found on PATH.")
-            if Confirm.ask(
-                "Install codex CLI now via pip? (you can also install manually later)",
-                default=False,
-            ):
+            if Confirm.ask("Install codex CLI now via pip?", default=False):
                 subprocess.run([sys.executable, "-m", "pip", "install", "codex-cli"], check=False)
                 codex_ok = bool(shutil.which("codex"))
 
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             entered = Prompt.ask(
-                "Paste your OpenAI API key (or press Enter to skip and use `codex login` later)",
+                "Paste your OpenAI API key (Enter to skip and use `codex login`)",
                 default="",
                 password=True,
             )
@@ -123,15 +115,13 @@ def configure_auditor(cfg: Config) -> None:
                 _append_env("OPENAI_API_KEY", entered)
                 os.environ["OPENAI_API_KEY"] = entered
         if not codex_ok:
-            warn("Codex will be unavailable until you install the CLI and configure auth.")
+            warn("Codex will be unavailable until you install the CLI + configure auth.")
 
     if choice in ("B", "C"):
         anth_key = os.environ.get("ANTHROPIC_API_KEY")
         if not anth_key:
             entered = Prompt.ask(
-                "Paste your Anthropic API key",
-                default="",
-                password=True,
+                "Paste your Anthropic API key", default="", password=True
             )
             if entered:
                 _append_env("ANTHROPIC_API_KEY", entered)
@@ -142,48 +132,126 @@ def configure_auditor(cfg: Config) -> None:
 
     if choice == "B":
         warn(
-            "Claude-auditing-Claude has shared-bias risk. Consider configuring Codex later "
-            "via `broker setup --audit-only`."
+            "Claude-auditing-Claude has shared-bias risk. Consider adding Codex "
+            "later — rerun `broker setup`."
         )
-    ok(
-        f"audit.primary = {cfg.audit.primary}, shadow_mode = {cfg.audit.shadow_mode}"
-    )
+    ok(f"audit.primary = {cfg.audit.primary}, shadow_mode = {cfg.audit.shadow_mode}")
 
 
-def configure_vast(_cfg: Config) -> None:
-    console.print(
-        "Open https://vast.ai in the same Chrome profile you'll use with this skill and "
-        "log in. The skill doesn't store your vast password — it just reuses an existing "
-        "logged-in browser session."
-    )
-    Prompt.ask("Press Enter once you're logged into vast.ai", default="")
-    ok("assuming vast.ai login is active")
+# --------------------------------------------------------------------------
 
 
-def configure_funding(_cfg: Config) -> None:
+def configure_payment_methods(cfg: Config) -> None:
     console.print(
         Panel.fit(
-            "You need USDC in your MetaMask wallet. For this skill we default to Polygon\n"
-            "USDC because gas is cheap and settlement is fast.\n\n"
-            "If you're starting from zero:\n"
-            "  1. Buy USDC on an exchange (OKX / Coinbase / Binance)\n"
-            "  2. Withdraw USDC on Polygon network to your MetaMask address\n"
-            "  3. Verify the balance shows up in your MetaMask extension\n\n"
-            "For a $10 topup you want at least ~$15 in the wallet to cover future runs.",
-            title="Step 4 — Fund MetaMask with USDC",
+            "[bold]Payment methods[/] are the rails the broker may use on your "
+            "behalf. The broker never stores card numbers or seed phrases — we "
+            "store only the label, rail, and last-4 / wallet address so the UI "
+            "can show which method was charged.\n\n"
+            "Pick any combination of:\n"
+            "  • [bold]card[/]        — credit/debit via Chrome autofill, 1Password, "
+            "Apple Pay, or manual entry at checkout time\n"
+            "  • [bold]crypto[/]      — MetaMask / WalletConnect with USDC on a cheap chain\n"
+            "  • [bold]email_link[/] — merchants that use email OTP / magic links\n\n"
+            "You can enroll multiple methods per rail.",
+            title="Payment methods",
             border_style="cyan",
         )
     )
-    if not Confirm.ask("Is your MetaMask funded with USDC?", default=True):
-        warn("Fund your wallet before using the skill. Setup will continue with remaining steps.")
+
+    existing_names = {pm.name for pm in cfg.payment_methods}
+    methods: list[PaymentMethod] = list(cfg.payment_methods)
+
+    while True:
+        if methods:
+            console.print("[dim]current methods:[/] " + ", ".join(f"{m.name} ({m.rail})" for m in methods))
+        if not Confirm.ask("Add a payment method?", default=len(methods) == 0):
+            break
+        rail = Prompt.ask(
+            "Rail", choices=["card", "crypto", "email_link"], default="card"
+        )
+        default_name = {
+            "card": "personal card",
+            "crypto": "metamask main",
+            "email_link": "email magic link",
+        }[rail]
+        while True:
+            name = Prompt.ask("Label (short nickname)", default=default_name).strip()
+            if name and name not in existing_names:
+                break
+            warn(f"{name!r} is already used; pick a different label.")
+        existing_names.add(name)
+
+        pm = PaymentMethod(name=name, rail=rail)
+        if rail == "card":
+            last4 = Prompt.ask("Last 4 digits (optional, for display only)", default="").strip()
+            pm.last4 = last4 or None
+            pm.notes = Prompt.ask("Notes (e.g. 'chrome autofill work profile')", default="").strip()
+        elif rail == "crypto":
+            addr = Prompt.ask("Wallet address (first + last chars shown in logs)", default="").strip()
+            pm.wallet_address = addr or None
+            pm.notes = Prompt.ask("Notes (e.g. 'MetaMask · Polygon · USDC')", default="").strip()
+        else:
+            pm.notes = Prompt.ask(
+                "Email address for magic-link delivery (notes only)", default=""
+            ).strip()
+
+        if Confirm.ask("Set a per-method auto-execute ceiling (USD)?", default=False):
+            pm.max_auto_execute_usd = FloatPrompt.ask(
+                "Max auto-execute for this method (USD)", default=25.0
+            )
+        methods.append(pm)
+        ok(f"added {name} ({rail})")
+
+    cfg.payment_methods = methods
+
+    # Keep rails preference aligned with enrolled rails. Push enrolled rails
+    # to the top of cfg.rails in the order the user enrolled them.
+    enrolled_order: list[str] = []
+    for m in methods:
+        if m.rail not in enrolled_order:
+            enrolled_order.append(m.rail)
+    for r in cfg.rails:
+        if r not in enrolled_order:
+            enrolled_order.append(r)
+    cfg.rails = enrolled_order
+
+
+# --------------------------------------------------------------------------
+
+
+def review_merchants(cfg: Config) -> None:
+    if not cfg.merchants:
+        # fall back to default policy list
+        raw = yaml.safe_load(default_policy_path().read_text(encoding="utf-8"))
+        cfg.merchants = [_merchant_from_dict(m) for m in raw.get("merchants", [])]
+
+    console.print(
+        "[bold]Merchant allowlist[/] — the broker refuses any intent targeting a "
+        "merchant not listed here. Default list covers openrouter.ai, vast.ai, "
+        "anthropic.com. Review and remove / keep each."
+    )
+    kept: list[MerchantConfig] = []
+    for m in cfg.merchants:
+        rails = ", ".join(m.playbooks.keys()) or "(none)"
+        keep = Confirm.ask(
+            f"Keep {m.name} (rails: {rails}, cap ${m.max_single_topup_usd:.0f})?",
+            default=True,
+        )
+        if keep:
+            kept.append(m)
+    cfg.merchants = kept
+
+
+# --------------------------------------------------------------------------
 
 
 def configure_policy(cfg: Config) -> None:
     console.print(
-        "[bold]Spending thresholds[/] decide when audit + user prompts kick in:\n"
-        "  L0 (<= l0_ceiling): audit runs, auto-execute on approve (no popup)\n"
-        "  L1 (l0 < amount <= l1): audit runs, MetaMask popup asks you to sign\n"
-        "  L2 (> l1_ceiling): broker refuses; you must approve out of band.\n"
+        "[bold]Spending thresholds[/] decide when human gates kick in:\n"
+        "  L0 (<= l0_ceiling): audit approves → auto-execute (rail's own gate still runs)\n"
+        "  L1: audit approves, rail gate must be completed by human\n"
+        "  L2 (> l1_ceiling): broker halts, asks user out of band\n"
     )
     cfg.thresholds.l0_ceiling_usd = FloatPrompt.ask(
         "L0 ceiling (USD)", default=cfg.thresholds.l0_ceiling_usd
@@ -199,6 +267,9 @@ def configure_policy(cfg: Config) -> None:
     )
 
 
+# --------------------------------------------------------------------------
+
+
 def smoke_test(cfg: Config) -> bool:
     from .auditor import select_auditor
 
@@ -209,36 +280,42 @@ def smoke_test(cfg: Config) -> bool:
         fail(f"audit setup: {e}")
         return False
 
-    # Init ledger
     init_ledger()
     ok(f"ledger initialised at {local_root() / 'ledger.sqlite'}")
 
-    # Dry-run topup
+    # Dry-run end-to-end: picks a small amount and a valid merchant + enrolled rail.
     os.environ["KYA_BROKER_DRY_RUN"] = "1"
     os.environ["KYA_BROKER_DRY_RUN_OUTCOME"] = "settled"
+    os.environ.setdefault("KYA_BROKER_DRY_RUN_AUDITOR", "approve")
+    os.environ["KYA_BROKER_DRY_RUN_HUMAN_GATE"] = "completed"
+
     import asyncio
 
     from .auditor.base import AuditContext
     from .broker import Broker
 
+    merchant = cfg.merchants[0].name if cfg.merchants else "openrouter.ai"
+    rail_hint = cfg.payment_methods[0].rail if cfg.payment_methods else None
+
     async def _run() -> bool:
-        broker = Broker()
+        broker = Broker(config=cfg)
         resp = await broker.propose_intent(
             {
-                "merchant": "vast.ai",
+                "merchant": merchant,
                 "amount_usd": 0.5,
-                "rationale": "dry-run smoke test for setup wizard — no real money",
+                "rationale": "setup wizard dry-run — no real money moves in DRY_RUN mode",
                 "estimated_actual_cost_usd": 0.5,
+                "rail_hint": rail_hint,
             },
             AuditContext(
                 conversation_excerpt=(
                     "User is running the KYA-Broker setup wizard and asked for a dry-run "
-                    "smoke test to confirm the broker can propose, audit, and execute a "
-                    "small intent end-to-end."
+                    "smoke test to confirm the full pipeline (audit + rail + human gate "
+                    "+ ledger) works end-to-end."
                 ),
             ),
         )
-        return resp.state in {"settled", "rejected"}  # reject is acceptable (auditor may err cautious)
+        return resp.state in {"settled", "rejected"}
 
     try:
         if asyncio.run(_run()):
@@ -252,24 +329,22 @@ def smoke_test(cfg: Config) -> bool:
 
 
 def write_config(cfg: Config) -> None:
-    # Ensure default merchants list populated if empty
-    if not cfg.merchants:
-        raw = yaml.safe_load(default_policy_path().read_text(encoding="utf-8"))
-        cfg.merchants = [
-            _merchant_from_dict(m) for m in raw.get("merchants", [])
-        ]
     save_config(cfg)
     ok(f"config written to {local_root() / 'config.yaml'}")
 
 
-def _merchant_from_dict(d: dict):
-    from .config import MerchantConfig
-
+def _merchant_from_dict(d: dict) -> MerchantConfig:
+    playbooks = d.get("playbooks") or (
+        {d.get("preferred_rail", "card"): d["playbook"]} if d.get("playbook") else {}
+    )
     return MerchantConfig(
         name=d["name"],
-        playbook=d["playbook"],
+        playbooks={str(k): str(v) for k, v in playbooks.items()},
         max_single_topup_usd=float(d.get("max_single_topup_usd", 50.0)),
-        preferred_rail=d.get("preferred_rail", "crypto"),
+        preferred_rail=str(d.get("preferred_rail", "card")),
+        homepage_url=str(d.get("homepage_url", "")),
+        credit_page_url=str(d.get("credit_page_url", "")),
+        notes=str(d.get("notes", "")),
     )
 
 
@@ -281,41 +356,43 @@ def _append_env(key: str, value: str) -> None:
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# --------------------------------------------------------------------------
+
+
 def main() -> None:
     console.print(
         Panel.fit(
             "[bold cyan]KYA-Broker setup[/]\n"
-            "This wizard takes about 10-15 minutes. You can rerun it any time.",
+            "Lets Claude Code autonomously pay merchants (OpenRouter, vast.ai, "
+            "Anthropic, …) using your human payment methods. The skill drives the "
+            "browser; you authorise each payment at the card / wallet / email step.",
             border_style="cyan",
         )
     )
 
-    step(1, 6, "Check prerequisites")
+    step(1, 6, "Prerequisites")
     if not check_prereqs():
-        warn("prerequisites not fully satisfied; continue anyway? (y/N)")
-        if not Confirm.ask("Continue?", default=False):
+        if not Confirm.ask("Prereqs not fully satisfied. Continue anyway?", default=False):
             sys.exit(1)
 
-    # Ensure we have a config to edit (load default if none yet)
+    # Load or seed config
     try:
         cfg = load_config()
     except Exception:
-        # Copy default policy into place for the first run
-        default_policy_path_ = default_policy_path()
-        raw = default_policy_path_.read_text(encoding="utf-8")
+        raw = default_policy_path().read_text(encoding="utf-8")
         (local_root() / "config.yaml").write_text(raw, encoding="utf-8")
         cfg = load_config()
 
-    step(2, 6, "Configure audit layer")
+    step(2, 6, "Audit layer")
     configure_auditor(cfg)
 
-    step(3, 6, "Confirm vast.ai login")
-    configure_vast(cfg)
+    step(3, 6, "Enroll payment methods")
+    configure_payment_methods(cfg)
 
-    step(4, 6, "Fund MetaMask")
-    configure_funding(cfg)
+    step(4, 6, "Merchant allowlist")
+    review_merchants(cfg)
 
-    step(5, 6, "Set spending policy")
+    step(5, 6, "Spending thresholds")
     configure_policy(cfg)
 
     write_config(cfg)
@@ -327,7 +404,7 @@ def main() -> None:
         console.print(
             Panel.fit(
                 "[yellow]Setup mostly complete, but smoke test did not pass.[/]\n"
-                "Re-run `broker setup` after fixing the warnings above.",
+                "Rerun `broker setup` after fixing the warnings above.",
                 border_style="yellow",
             )
         )
