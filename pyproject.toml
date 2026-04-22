@@ -1,0 +1,49 @@
+[project]
+name = "kya-broker"
+version = "0.3.1"
+description = "Autonomous payment skill for Claude Code — crypto topup for GPU research workflows via user's MetaMask wallet"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "KYA Broker Contributors" },
+]
+keywords = ["claude-code", "skill", "payment", "agent", "vast-ai", "metamask"]
+dependencies = [
+    "anthropic>=0.40.0",
+    "click>=8.1.0",
+    "pyyaml>=6.0",
+    "httpx>=0.27.0",
+    "mcp>=1.0.0",
+    "rich>=13.7.0",
+    "platformdirs>=4.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+broker = "src.cli:main"
+kya-broker-setup = "src.setup_wizard:main"
+kya-broker-mcp = "src.mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

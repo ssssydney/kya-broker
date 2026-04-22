@@ -1,0 +1,78 @@
+name: vast_topup_crypto
+description: Top up vast.ai account using MetaMask USDC via crypto.com checkout
+version: 1
+
+preconditions:
+  - user_logged_in_vast: "https://vast.ai/billing is reachable and shows account email"
+  - metamask_installed: "MetaMask extension present in the attached Chrome profile"
+  - usdc_funded: "MetaMask address has at least amount_usd worth of USDC on the configured chain"
+
+steps:
+  - goto: "https://vast.ai/billing"
+
+  - wait_for: "billing page loaded (element with class=billing-main visible)"
+
+  - click_visual: "Add Credits"
+
+  - wait_for: "topup modal open"
+
+  - select_amount: "${{ intent.amount_usd }}"
+
+  - click_visual: "Crypto"
+
+  - wait_for: "crypto.com checkout frame loads"
+
+  - click_visual: "Connect Wallet"
+
+  - select_wallet: "MetaMask"
+
+  # --- L2 authorization boundary ---
+  # Everything below this line stalls until the user takes action inside MetaMask.
+  # The broker does NOT click Confirm; that is the user's decision.
+  - wait_for_metamask_popup:
+      action: "User reviews amount and recipient in native MetaMask UI, then signs or declines."
+      timeout: 300s
+
+  # Back on the crypto.com page once the user signed.
+  - wait_for: "crypto.com shows 'Payment received' or 'Confirmed'"
+
+  # vast.ai settlement: crypto.com forwards to merchant, merchant credits account.
+  - wait_for_merchant_settlement:
+      merchant: "vast.ai"
+      expected_amount: "$${{ intent.amount_usd }}"
+      timeout: 300s
+
+  - record_outcome:
+      state: settled
+      tx_hash_from_page: true
+      merchant_receipt_from: "vast.ai billing history top entry"
+
+failure_modes:
+  metamask_popup_missing:
+    detect: "wait_for_metamask_popup exceeded timeout AND popup targets never appeared"
+    action: "mark playbook_broken; dump DOM + screenshot to kya-broker.local/dumps/"
+    user_message: |
+      MetaMask popup never appeared. Common causes: MetaMask locked, extension disabled, popup
+      blocked by another modal. Open MetaMask manually to unlock, then run `broker resume`.
+
+  user_declined:
+    detect: "page text contains 'cancel' / 'rejected' / 'declined' during wait_for_metamask_popup"
+    action: "mark user_declined; do not retry"
+    user_message: |
+      You declined the signature in MetaMask. No charge was made. If this was accidental,
+      ask Claude to retry the experiment; a fresh intent will be proposed.
+
+  merchant_settlement_timeout:
+    detect: "wait_for_merchant_settlement exceeded timeout"
+    action: "save tx_hash to ledger, mark failed; flag for manual reconcile"
+    user_message: |
+      The crypto payment went through on-chain but vast.ai hasn't credited the account yet.
+      Usually settles within 5 minutes. Check https://vast.ai/billing manually; if the credit
+      never appears, file a ticket with vast support citing the tx hash from `broker status`.
+
+  vast_ui_changed:
+    detect: "any click_visual step cannot locate the target element"
+    action: "dump DOM + screenshot, mark playbook_broken"
+    user_message: |
+      vast.ai billing UI appears to have changed. File an issue on the skill repo with the
+      dump under kya-broker.local/dumps/ so we can update the playbook.

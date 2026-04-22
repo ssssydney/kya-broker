@@ -1,0 +1,13 @@
+{
+  "conversation_excerpt": "User asked: 'reproduce the attention-sink finding from this paper'. I read the paper (Xiao et al. 2023, arXiv:2309.17453), confirmed it uses 2 H100s for a 4-hour run on the Table 3 configuration. Vast.ai currently shows H100 offers at $0.85-1.10/hr verified providers. Estimate 4 hours at $0.90 avg = $7.20 compute, plus ~40% buffer for a possible rerun and for slight overprovisioning, rounding to $10 topup.",
+  "cited_files": [
+    {
+      "path": "papers/attention-sink.pdf",
+      "content_excerpt": "Table 3 reports perplexity measurements across 8 model scales on the proof-of-concept streaming benchmark. Training on 2×H100 for 4 epochs (~4h wall time on 70B params)."
+    },
+    {
+      "path": "scripts/reproduce_table3.py",
+      "content_excerpt": "#!/usr/bin/env python\n# Reproduces Xiao 2023 Table 3. Expects 2 GPUs visible.\nimport torch, transformers\nMODEL='meta-llama/Llama-2-7b-hf'\nASSUME_GPUS=2\n# ... checkpointing every 100 steps, resumable, ~4h total."
+    }
+  ]
+}

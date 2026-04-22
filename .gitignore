@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.env
+.env.local
+*.log
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Never commit user local state
+kya-broker.local/
+ledger.sqlite
+config.yaml
+
+# Artifacts
+*.pem
+*.key
+screenshots/
+dom_snapshots/

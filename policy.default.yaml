@@ -1,0 +1,79 @@
+# KYA-Broker default policy template.
+# setup.py copies this to ~/.claude/skills/kya-broker.local/config.yaml
+# and the user edits thresholds to their tolerance.
+
+version: 1
+
+# --- Spending thresholds (USD) ---
+# L0 (auto-execute): intent.amount <= l0_ceiling AND passes audit → execute without user confirm
+# L1 (audit required): l0_ceiling < intent.amount <= l1_ceiling → audit must approve, then MetaMask popup
+# L2 (explicit user confirm): intent.amount > l1_ceiling → broker halts, asks human before even auditing
+thresholds:
+  l0_ceiling_usd: 2.00
+  l1_ceiling_usd: 50.00
+  daily_cap_usd: 200.00
+  monthly_cap_usd: 1000.00
+
+# --- Audit layer ---
+audit:
+  # Which auditor decides verdicts: codex | claude | auto
+  # auto = use codex if available, else fall back to claude
+  primary: auto
+
+  # When true and both auditors configured, run the non-primary auditor in parallel
+  # but only the primary verdict gates execution. Results of both go to ledger for
+  # A/B analysis (see `broker analyze-audits`).
+  shadow_mode: false
+
+  # If primary auditor hard-fails (timeout, malformed output, crashed subprocess)
+  # fall back to the other configured auditor. Default false because fallback
+  # weakens cross-model independence guarantees.
+  fallback_on_primary_failure: false
+
+  timeout_seconds: 30
+
+  codex:
+    model: gpt-5-codex
+    # Optional path override to the codex binary
+    binary_path: null
+
+  claude:
+    model: claude-sonnet-4-6
+    max_output_tokens: 2000
+
+# --- Merchant allowlist ---
+# Only merchants in this list are eligible for auto-execute at L0.
+# Adding merchants at runtime requires user confirmation.
+merchants:
+  - name: vast.ai
+    playbook: vast_topup_crypto.yaml
+    max_single_topup_usd: 50.00
+    preferred_rail: crypto
+
+# --- Rail preferences ---
+rails:
+  - crypto          # MetaMask → crypto.com checkout → USDC on Polygon (cheap, fast)
+  - fiat_card       # reserved for v0.4+ (Stripe Issuing)
+
+# --- Chrome ---
+chrome:
+  # Path to the Chrome binary. Auto-detected during setup; override here if needed.
+  binary_path: null
+
+  # CDP port. If another Chrome is running with --remote-debugging-port=9222 the
+  # broker attaches; otherwise it launches a fresh window using `chrome.profile_dir`.
+  cdp_port: 9222
+
+  # Chrome user-data-dir. Must contain MetaMask extension + logged-in vast.ai session.
+  profile_dir: null
+
+  # Max seconds to wait for MetaMask signature popup.
+  metamask_popup_timeout_s: 300
+
+# --- Observability ---
+observability:
+  # Dump DOM + screenshot when a playbook step fails.
+  capture_on_failure: true
+
+  # Retain raw auditor outputs in ledger (useful for A/B research, adds ~10KB/intent).
+  retain_raw_audit_output: true

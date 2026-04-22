@@ -1,0 +1,10 @@
+{
+  "merchant": "vast.ai",
+  "amount_usd": 10.0,
+  "rationale": "Reproducing Xiao et al. 2023 attention-sink finding on 2x H100 per paper Table 3. Estimate ~4h at vast H100 rate ($0.90/gpu-hr) = $7.20 plus 35% buffer for setup + rerun if first pass fails.",
+  "estimated_actual_cost_usd": 7.20,
+  "references": [
+    "papers/attention-sink.pdf",
+    "scripts/reproduce_table3.py"
+  ]
+}
