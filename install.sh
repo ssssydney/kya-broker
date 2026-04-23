@@ -10,6 +10,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_ROOT="${KYA_BROKER_LOCAL:-$HOME/.claude/skills/kya-broker.local}"
 
+# install.sh honours KYA_BROKER_HOME so that the CLI wrappers, when the skill
+# lives at ~/.local/opt/kya-broker/ after bootstrap, point to the opt dir and
+# NOT to the standalone SKILL.md the user saved under ~/.claude/skills/.
+export KYA_BROKER_HOME="${KYA_BROKER_HOME:-$SCRIPT_DIR}"
+
 echo ">> KYA-Broker install"
 echo "   skill_root = ${SCRIPT_DIR}"
 echo "   local_root = ${LOCAL_ROOT}"

@@ -27,6 +27,7 @@ from mcp.types import TextContent, Tool
 
 from .auditor import AuditContext
 from .broker import Broker, BrokerError
+from .email_lock import EmailLockError, load_locked_email, lock_email
 
 logger = logging.getLogger("kya_broker.mcp")
 
@@ -110,10 +111,38 @@ TOOL_DEFS: list[Tool] = [
     Tool(
         name="check_balance",
         description=(
-            "Return MetaMask USDC balance (when Chrome is running), vast.ai credit (when "
-            "cached), today's and this month's spend, and remaining caps."
+            "Return MetaMask USDC balance (when Chrome is running), merchant credit "
+            "(when cached), today's and this month's spend, and remaining caps."
         ),
         inputSchema={"type": "object", "properties": {}},
+    ),
+    Tool(
+        name="email_lock_status",
+        description=(
+            "Returns whether a confirmation email is locked for this install. "
+            "Call this FIRST when the user asks for a payment — if no email is "
+            "locked, you must ask the user for one and call email_lock_set before "
+            "submitting any intent."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    Tool(
+        name="email_lock_set",
+        description=(
+            "Lock the confirmation email (write-once). The email cannot be changed "
+            "after this call — a reset requires the user to run `broker email-lock "
+            "--reset` from the terminal explicitly."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["email"],
+            "properties": {
+                "email": {
+                    "type": "string",
+                    "description": "Email address. Must be a syntactically valid address.",
+                },
+            },
+        },
     ),
 ]
 
@@ -159,6 +188,20 @@ def _make_server() -> Server:
 
             if name == "check_balance":
                 return _result(broker.check_balance())
+
+            if name == "email_lock_status":
+                try:
+                    email = load_locked_email()
+                except EmailLockError as e:
+                    return _result({"locked": False, "tampered": True, "error": str(e)})
+                return _result({"locked": email is not None, "email": email})
+
+            if name == "email_lock_set":
+                try:
+                    lock = lock_email(arguments["email"])
+                except EmailLockError as e:
+                    return _error("email_lock_error", str(e))
+                return _result({"locked": True, "email": lock.email, "locked_at": lock.locked_at})
 
             return _error("unknown_tool", f"unknown tool {name!r}")
         except BrokerError as e:

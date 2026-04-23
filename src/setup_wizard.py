@@ -29,6 +29,12 @@ from .config import (
     load_config,
     save_config,
 )
+from .email_lock import (
+    EmailLockError,
+    EmailLockViolation,
+    load_locked_email,
+    lock_email,
+)
 from .ledger import init_ledger
 from .paths import default_policy_path, env_path, local_root
 
@@ -139,6 +145,118 @@ def configure_auditor(cfg: Config) -> None:
 
 
 # --------------------------------------------------------------------------
+
+
+def configure_email_lock() -> None:
+    """Lock the confirmation email (write-once)."""
+    try:
+        existing = load_locked_email()
+    except EmailLockError as e:
+        fail(f"email lock file is tampered: {e}")
+        return
+    if existing:
+        ok(f"email already locked: {existing}")
+        console.print(
+            "[dim]this lock is permanent for this install. "
+            "Reset requires `broker email-lock --reset` — see docs.[/]"
+        )
+        return
+
+    console.print(
+        Panel.fit(
+            "[bold]Confirmation email (write-once)[/]\n\n"
+            "Every payment intent is preceded by a 6-digit code sent to this "
+            "address. Once set, the email cannot be changed without running "
+            "`broker email-lock --reset` explicitly — an agent that got "
+            "compromised mid-conversation cannot silently reroute your OTP "
+            "channel to an attacker's inbox.\n\n"
+            "This is independent of whatever account email you use with each "
+            "merchant. It is the [italic]broker's own[/] authorization channel.",
+            title="Email lock",
+            border_style="cyan",
+        )
+    )
+    while True:
+        address = Prompt.ask("Confirmation email address").strip()
+        if not address:
+            warn("can't be blank")
+            continue
+        try:
+            lock_email(address)
+        except EmailLockViolation as e:
+            fail(str(e))
+            return
+        except EmailLockError as e:
+            warn(str(e))
+            continue
+        ok(f"locked: {address}")
+        break
+
+
+def configure_smtp() -> None:
+    """SMTP credentials for sending OTP emails. Stored in .env, NOT config.yaml."""
+    console.print(
+        "[bold]SMTP for OTP delivery[/] — we send the 6-digit code via SMTP. "
+        "For Gmail, use an [italic]app password[/] (Account → Security → App "
+        "passwords); do NOT use your main password."
+    )
+    has_smtp = bool(os.environ.get("KYA_BROKER_SMTP_HOST"))
+    if has_smtp:
+        ok(f"SMTP already configured via env ({os.environ['KYA_BROKER_SMTP_HOST']})")
+        if not Confirm.ask("Reconfigure?", default=False):
+            return
+
+    host = Prompt.ask("SMTP host", default="smtp.gmail.com")
+    port = Prompt.ask("SMTP port (465 for SSL, 587 for STARTTLS)", default="465")
+    user = Prompt.ask("SMTP user (the sender address)")
+    pw = Prompt.ask("SMTP password / app-password", password=True)
+    from_addr = Prompt.ask("From address (defaults to user)", default=user)
+    use_ssl = port == "465"
+
+    for key, val in [
+        ("KYA_BROKER_SMTP_HOST", host),
+        ("KYA_BROKER_SMTP_PORT", port),
+        ("KYA_BROKER_SMTP_USER", user),
+        ("KYA_BROKER_SMTP_PASS", pw),
+        ("KYA_BROKER_SMTP_FROM", from_addr),
+        ("KYA_BROKER_SMTP_USE_SSL", "true" if use_ssl else "false"),
+    ]:
+        _append_env(key, val)
+        os.environ[key] = val
+    ok("SMTP credentials written to .env")
+
+    if Confirm.ask(
+        "Send a test OTP email now to verify SMTP works?", default=True
+    ):
+        _smtp_test_send()
+
+
+def _smtp_test_send() -> None:
+    from email.message import EmailMessage
+
+    from .email_verifier import SmtpConfig, _send_email
+
+    smtp = SmtpConfig.from_env()
+    if smtp is None:
+        fail("SMTP env vars not picked up")
+        return
+    try:
+        locked = load_locked_email()
+    except EmailLockError:
+        locked = None
+    target = locked or smtp.user
+    msg = EmailMessage()
+    msg["Subject"] = "[KYA-Broker] SMTP test"
+    msg.set_content(
+        "This is a test message from your KYA-Broker setup. If you received it, "
+        "SMTP is configured correctly."
+    )
+    try:
+        _send_email(msg, target, smtp)
+    except Exception as e:  # noqa: BLE001
+        fail(f"test send failed: {e}")
+        return
+    ok(f"test email sent to {target}")
 
 
 def configure_payment_methods(cfg: Config) -> None:
@@ -288,6 +406,9 @@ def smoke_test(cfg: Config) -> bool:
     os.environ["KYA_BROKER_DRY_RUN_OUTCOME"] = "settled"
     os.environ.setdefault("KYA_BROKER_DRY_RUN_AUDITOR", "approve")
     os.environ["KYA_BROKER_DRY_RUN_HUMAN_GATE"] = "completed"
+    # In smoke test, bypass the email OTP's popup round-trip by providing a
+    # stub verifier that auto-approves. Real runs use the real verifier.
+    os.environ["KYA_BROKER_SMOKE_SKIP_OTP"] = "1"
 
     import asyncio
 
@@ -296,6 +417,10 @@ def smoke_test(cfg: Config) -> bool:
 
     merchant = cfg.merchants[0].name if cfg.merchants else "openrouter.ai"
     rail_hint = cfg.payment_methods[0].rail if cfg.payment_methods else None
+
+    # Auto-lock demo email for smoke test if none is locked
+    if load_locked_email() is None:
+        lock_email("setup-smoke@example.com")
 
     async def _run() -> bool:
         broker = Broker(config=cfg)
@@ -370,7 +495,7 @@ def main() -> None:
         )
     )
 
-    step(1, 6, "Prerequisites")
+    step(1, 8, "Prerequisites")
     if not check_prereqs():
         if not Confirm.ask("Prereqs not fully satisfied. Continue anyway?", default=False):
             sys.exit(1)
@@ -383,21 +508,27 @@ def main() -> None:
         (local_root() / "config.yaml").write_text(raw, encoding="utf-8")
         cfg = load_config()
 
-    step(2, 6, "Audit layer")
+    step(2, 8, "Confirmation email (write-once)")
+    configure_email_lock()
+
+    step(3, 8, "SMTP for OTP delivery")
+    configure_smtp()
+
+    step(4, 8, "Audit layer")
     configure_auditor(cfg)
 
-    step(3, 6, "Enroll payment methods")
+    step(5, 8, "Enroll payment methods")
     configure_payment_methods(cfg)
 
-    step(4, 6, "Merchant allowlist")
+    step(6, 8, "Merchant allowlist")
     review_merchants(cfg)
 
-    step(5, 6, "Spending thresholds")
+    step(7, 8, "Spending thresholds")
     configure_policy(cfg)
 
     write_config(cfg)
 
-    step(6, 6, "Smoke test")
+    step(8, 8, "Smoke test")
     if smoke_test(cfg):
         console.print(Panel.fit("[bold green]Setup complete.[/]", border_style="green"))
     else:

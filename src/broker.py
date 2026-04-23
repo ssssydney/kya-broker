@@ -21,6 +21,8 @@ from typing import Any
 from .auditor import AuditContext, AuditRunner, Verdict
 from .chrome_bridge import ChromeBridge, ChromeUnavailableError
 from .config import Config, load_config
+from .email_lock import EmailLockError, load_locked_email
+from .email_verifier import EmailOtpOutcome, EmailOtpVerifier
 from .intent import (
     DEFAULT_TTL_MINUTES,
     Intent,
@@ -58,11 +60,13 @@ class Broker:
         config: Config | None = None,
         ledger: Ledger | None = None,
         chrome: ChromeBridge | None = None,
+        email_verifier: EmailOtpVerifier | None = None,
     ):
         self.cfg = config or load_config()
         self.ledger = ledger or Ledger()
         self.chrome = chrome or ChromeBridge(self.cfg.chrome, self.cfg.notifications)
         self.audit = AuditRunner(self.cfg, self.ledger)
+        self.email_verifier = email_verifier or EmailOtpVerifier()
 
     # ---- submission -------------------------------------------------------
 
@@ -221,6 +225,20 @@ class Broker:
     async def _execute(
         self, intent: Intent, tier: str, verdict: Verdict
     ) -> BrokerResponse:
+        # --- Email OTP floor: ALWAYS fires before any browser drive ---
+        # The user's locked email is the trusted channel. Even if the merchant
+        # asks for nothing else, we send an OTP here and require the user to
+        # paste it into the popup. This is the broker's own authorization
+        # layer, independent of rail-specific gates that fire later in Chrome.
+        import os as _os
+
+        if self.cfg.email_otp.enabled and not _os.environ.get(
+            "KYA_BROKER_SMOKE_SKIP_OTP"
+        ):
+            otp_result = await self._run_email_otp(intent, tier)
+            if otp_result is not None:
+                return otp_result
+
         try:
             rail = select_rail(self.cfg, intent)
         except RailUnavailableError as e:
@@ -403,6 +421,89 @@ class Broker:
                 f"(spent ${spent_30d:.2f}, this intent ${intent.amount_usd:.2f})"
             )
         return None
+
+    async def _run_email_otp(
+        self, intent: Intent, tier: str
+    ) -> BrokerResponse | None:
+        """Run the broker-issued email OTP gate. Returns a failure response,
+        or None if the OTP succeeded (let caller continue).
+        """
+        try:
+            locked = load_locked_email()
+        except EmailLockError as e:
+            self.ledger.transition(
+                intent.intent_id,
+                IntentState.FAILED,
+                reason=f"email_lock_tampered: {e}",
+            )
+            return BrokerResponse(
+                intent_id=intent.intent_id,
+                state=IntentState.FAILED.value,
+                tier=tier,
+                message=str(e),
+            )
+        if locked is None:
+            self.ledger.transition(
+                intent.intent_id,
+                IntentState.FAILED,
+                reason="no_locked_email",
+            )
+            return BrokerResponse(
+                intent_id=intent.intent_id,
+                state=IntentState.FAILED.value,
+                tier=tier,
+                message=(
+                    "No confirmation email is locked. Run `broker email-lock "
+                    "<address>` once (the address is immutable for this install)."
+                ),
+            )
+
+        outcome: EmailOtpOutcome = await self.email_verifier.verify(
+            intent_id=intent.intent_id,
+            amount_usd=intent.amount_usd,
+            merchant=intent.merchant,
+            timeout_seconds=self.cfg.email_otp.timeout_seconds,
+        )
+        # Record the OTP result as a state event without changing state.
+        # The AUDITED → EXECUTING transition is made by the caller after rail
+        # selection, so we don't double-emit EXECUTING here.
+        if outcome.verified:
+            # No state change; log via a self-audit row for later inspection.
+            self.ledger.record_audit(
+                intent_id=intent.intent_id,
+                auditor_name="email_otp",
+                is_primary=False,
+                verdict="approve",
+                concerns=[
+                    f"code_was_sent={outcome.code_was_sent}",
+                    f"reason={outcome.reason}",
+                ],
+                recommended_amount_usd=None,
+                latency_ms=0,
+                input_tokens=None,
+                output_tokens=None,
+                raw_output=None,
+                model="broker-email-otp",
+            )
+            return None
+
+        # Failure path: map outcome → terminal state
+        terminal = (
+            IntentState.USER_DECLINED
+            if outcome.reason in {"declined", "timeout", "cancelled"}
+            else IntentState.FAILED
+        )
+        self.ledger.transition(
+            intent.intent_id,
+            terminal,
+            reason=f"email_otp_{outcome.reason}",
+        )
+        return BrokerResponse(
+            intent_id=intent.intent_id,
+            state=terminal.value,
+            tier=tier,
+            message=f"email OTP not confirmed: {outcome.reason}",
+        )
 
     @staticmethod
     def _row_to_intent(row: dict[str, Any]) -> Intent:

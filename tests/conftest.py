@@ -22,11 +22,18 @@ def _prepare_local(local: Path, monkeypatch) -> None:
         {"name": "test card", "rail": "card", "last4": "4242"},
         {"name": "test email link", "rail": "email_link"},
     ]
+    # Disable broker-issued email OTP during broker tests; dedicated email-OTP
+    # tests exercise that path with real popup stubs.
+    policy["email_otp"] = {"enabled": False, "timeout_seconds": 5}
     (local / "config.yaml").write_text(yaml.safe_dump(policy), encoding="utf-8")
     monkeypatch.setenv("KYA_BROKER_HOME", str(repo_root))
     monkeypatch.setenv("KYA_BROKER_DRY_RUN", "1")
     monkeypatch.setenv("KYA_BROKER_DRY_RUN_OUTCOME", "settled")
     monkeypatch.setenv("KYA_BROKER_DRY_RUN_HUMAN_GATE", "completed")
+    monkeypatch.setenv("KYA_BROKER_OTP_SHOW_IN_TERMINAL", "1")
+    # Prevent email_otp from being triggered in broker tests that load real
+    # config but share env. Individual email tests set KYA_BROKER_SMOKE_SKIP_OTP.
+    monkeypatch.setenv("KYA_BROKER_SMOKE_SKIP_OTP", "1")
 
 
 @pytest.fixture

@@ -103,9 +103,19 @@ chrome:
 notifications:
   channels:
     - terminal
+    - popup                   # open a local HTTP popup window for OTP / confirm
     # - osascript_notify      # macOS banner notification
     # - osascript_say         # speak the reason aloud (macOS)
   poll_interval_s: 1.0
+
+# --- Broker-issued email OTP (final authorization floor) ---
+# Every intent — regardless of merchant or rail — requires the user to confirm
+# a 6-digit code sent to the locked email. This runs BEFORE Chrome drives the
+# merchant's checkout, so it gates whether the browser flow even starts.
+# SMTP creds live in .env (KYA_BROKER_SMTP_*), NEVER in this file.
+email_otp:
+  enabled: true
+  timeout_seconds: 300
 
 # --- Observability ---
 observability:

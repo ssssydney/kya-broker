@@ -96,8 +96,20 @@ class ChromeConfig:
 
 @dataclass
 class NotificationConfig:
-    channels: list[str] = field(default_factory=lambda: ["terminal"])
+    channels: list[str] = field(default_factory=lambda: ["terminal", "popup"])
     poll_interval_s: float = 1.0
+
+
+@dataclass
+class EmailOtpConfig:
+    """Broker-issued email OTP settings. Enabled by default — the email lock +
+    OTP together form the broker's own authorization layer, independent of
+    whatever the merchant does.
+    """
+
+    enabled: bool = True
+    timeout_seconds: int = 300
+    # SMTP creds live in .env (KYA_BROKER_SMTP_*), NOT in config.yaml.
 
 
 @dataclass
@@ -116,6 +128,7 @@ class Config:
     rails: list[str] = field(default_factory=lambda: ["card", "crypto", "email_link"])
     chrome: ChromeConfig = field(default_factory=ChromeConfig)
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
+    email_otp: EmailOtpConfig = field(default_factory=EmailOtpConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
 
     def merchant(self, name: str) -> MerchantConfig | None:
@@ -201,8 +214,14 @@ def _dict_to_config(raw: dict[str, Any]) -> Config:
 
     notifications_raw = raw.get("notifications", {}) or {}
     notifications = NotificationConfig(
-        channels=list(notifications_raw.get("channels", ["terminal"])),
+        channels=list(notifications_raw.get("channels", ["terminal", "popup"])),
         poll_interval_s=float(notifications_raw.get("poll_interval_s", 1.0)),
+    )
+
+    email_otp_raw = raw.get("email_otp", {}) or {}
+    email_otp = EmailOtpConfig(
+        enabled=bool(email_otp_raw.get("enabled", True)),
+        timeout_seconds=int(email_otp_raw.get("timeout_seconds", 300)),
     )
 
     obs = ObservabilityConfig(**raw.get("observability", {}))
@@ -218,6 +237,7 @@ def _dict_to_config(raw: dict[str, Any]) -> Config:
         rails=rails,
         chrome=chrome,
         notifications=notifications,
+        email_otp=email_otp,
         observability=obs,
     )
 
@@ -285,6 +305,10 @@ def save_config(cfg: Config) -> None:
         "notifications": {
             "channels": cfg.notifications.channels,
             "poll_interval_s": cfg.notifications.poll_interval_s,
+        },
+        "email_otp": {
+            "enabled": cfg.email_otp.enabled,
+            "timeout_seconds": cfg.email_otp.timeout_seconds,
         },
         "observability": cfg.observability.__dict__,
     }

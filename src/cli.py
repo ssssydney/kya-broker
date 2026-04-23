@@ -26,6 +26,13 @@ from rich.table import Table
 from . import __version__
 from .auditor import AuditContext
 from .broker import Broker, BrokerError
+from .email_lock import (
+    EmailLockError,
+    EmailLockViolation,
+    load_locked_email,
+    lock_email,
+    reset_lock,
+)
 from .ledger import Ledger
 
 console = Console()
@@ -223,6 +230,165 @@ def export_logs_cmd(outfile: Path) -> None:
     }
     outfile.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
     console.print(f"[green]wrote[/] {outfile}")
+
+
+@cli.command("email-lock")
+@click.argument("address", required=False)
+@click.option("--show", is_flag=True, help="Show the currently locked email.")
+@click.option("--reset", is_flag=True, help="Reset the lock (requires confirmation).")
+def email_lock_cmd(address: str | None, show: bool, reset: bool) -> None:
+    """Set (write-once) or inspect the broker's confirmation email.
+
+    Usage:
+        broker email-lock warrenzhong666@gmail.com    # initial lock
+        broker email-lock --show                       # inspect
+        broker email-lock --reset                      # wipe (will prompt to confirm)
+    """
+    if show:
+        try:
+            email = load_locked_email()
+        except EmailLockError as e:
+            console.print(f"[red]tampered:[/] {e}")
+            sys.exit(2)
+        if email is None:
+            console.print("[yellow]no email is locked yet[/]")
+            return
+        console.print(f"[green]locked:[/] {email}")
+        return
+
+    if reset:
+        console.print(
+            "[yellow]warning:[/] resetting the lock invalidates the OTP channel. "
+            "Any in-flight intents may succeed even though a malicious agent could "
+            "have rerouted their OTPs. Only reset when you are certain this is "
+            "what you want."
+        )
+        if not click.confirm("Proceed with reset?", default=False):
+            console.print("cancelled.")
+            return
+        reset_lock("I_UNDERSTAND_THIS_INVALIDATES_PAST_INTENTS")
+        console.print("[green]lock cleared.[/]")
+        return
+
+    if not address:
+        console.print("supply an email address, or use --show / --reset")
+        sys.exit(1)
+    try:
+        lock = lock_email(address)
+    except EmailLockViolation as e:
+        console.print(f"[red]violation:[/] {e}")
+        sys.exit(2)
+    except EmailLockError as e:
+        console.print(f"[red]error:[/] {e}")
+        sys.exit(2)
+    console.print(f"[green]locked[/] {lock.email} at {lock.locked_at}")
+
+
+@cli.command("demo")
+@click.option(
+    "--merchant", default="openrouter.ai", help="Merchant to simulate a topup for."
+)
+@click.option("--amount", type=float, default=1.0, help="Dollar amount.")
+@click.option(
+    "--with-popup/--no-popup",
+    default=False,
+    help=(
+        "With --with-popup, actually opens the local popup window so you can see it. "
+        "Default --no-popup just runs the pipeline start-to-finish without blocking."
+    ),
+)
+def demo_cmd(merchant: str, amount: float, with_popup: bool) -> None:
+    """Zero-config end-to-end dry-run. No real money, no API keys, no browser.
+
+    Sets KYA_BROKER_DRY_RUN + friends automatically and runs a fake intent
+    through the full pipeline (audit → optional email-OTP popup → execution
+    → ledger). Useful for: verifying the install works, onboarding a new
+    machine, or exercising the popup window locally.
+
+    The email used is always "demo@example.com"; real runs use the address
+    the user locks via `broker email-lock <addr>`.
+    """
+    import asyncio
+    import os
+
+    os.environ.setdefault("KYA_BROKER_DRY_RUN", "1")
+    os.environ.setdefault("KYA_BROKER_DRY_RUN_AUDITOR", "approve")
+    os.environ.setdefault("KYA_BROKER_DRY_RUN_OUTCOME", "settled")
+    os.environ.setdefault("KYA_BROKER_DRY_RUN_HUMAN_GATE", "completed")
+    os.environ.setdefault("KYA_BROKER_OTP_SHOW_IN_TERMINAL", "1")
+
+    if not with_popup:
+        os.environ["KYA_BROKER_SMOKE_SKIP_OTP"] = "1"
+
+    # Demo needs an email-lock; auto-lock a demo placeholder if none yet.
+    locked = load_locked_email()
+    if locked is None:
+        lock_email("demo@example.com")
+        console.print(
+            "[dim]no email lock found in this install → auto-locked demo@example.com "
+            "for this run (real use should lock your actual email via "
+            "`broker email-lock <addr>`)[/]"
+        )
+    else:
+        console.print(f"[dim]using locked email: {locked}[/]")
+
+    # Demo also needs at least one enrolled payment method. If none, inject
+    # a demo card so rail selection can succeed.
+    from .config import PaymentMethod, load_config, save_config
+
+    cfg = load_config()
+    if not cfg.payment_methods:
+        cfg.payment_methods.append(
+            PaymentMethod(
+                name="demo card",
+                rail="card",
+                last4="4242",
+                notes="auto-enrolled by broker demo; not a real card",
+            )
+        )
+        if "card" not in cfg.rails:
+            cfg.rails.insert(0, "card")
+        save_config(cfg)
+        console.print(
+            "[dim]no payment methods enrolled → auto-added a 'demo card' for the "
+            "card rail. Real use: run `broker setup` to enroll your actual methods.[/]"
+        )
+
+    if with_popup:
+        console.print(
+            "[yellow]--with-popup is set.[/] A browser tab will open with the "
+            "OTP popup; the code is printed above (SHOW_IN_TERMINAL=1). Paste it "
+            "to complete the demo, or click Decline to see the decline path."
+        )
+
+    payload = {
+        "merchant": merchant,
+        "amount_usd": amount,
+        "rationale": (
+            f"demo run — no real money moves. Simulating a ${amount:.2f} topup at "
+            f"{merchant} to verify the broker pipeline works end-to-end."
+        ),
+        "estimated_actual_cost_usd": amount,
+    }
+    broker = Broker()
+    console.print(f"[bold]demo:[/] proposing {json.dumps(payload, ensure_ascii=False)}")
+    try:
+        resp = asyncio.run(
+            broker.propose_intent(
+                payload,
+                AuditContext(
+                    conversation_excerpt=(
+                        "User ran `broker demo` to exercise the pipeline. No real "
+                        "payment intent — auditor is mocked, human gate is mocked, "
+                        "rail execution is mocked."
+                    ),
+                ),
+            )
+        )
+    except BrokerError as e:
+        console.print(f"[red]broker error:[/] {e}")
+        sys.exit(2)
+    click.echo(json.dumps(resp.to_dict(), ensure_ascii=False, indent=2))
 
 
 def main() -> None:
