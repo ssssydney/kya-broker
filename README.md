@@ -61,6 +61,10 @@ The result: less code, less setup, fewer failure modes, broader merchant coverag
 
 What we lose: the cross-model-family audit. Acceptable for everyday top-ups under $100 against merchants with their own fraud detection.
 
+## Real example
+
+See [docs/walkthrough.md](docs/walkthrough.md) for a full, real-world session: $5 vast.ai topup via VISA, screenshot at every money-moving step, no audit / OTP / SMTP. Starts with `broker log`, ends with `broker update --status settled`.
+
 ## CLI reference
 
 | Command | What it does |
