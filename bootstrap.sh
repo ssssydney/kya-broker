@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# One-shot bootstrap. Invoked by the standalone SKILL.md on first use via:
+# v1.0 bootstrap. Idempotent; safe to re-run.
 #
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/bootstrap.sh)"
-#
-# Idempotent. If the repo is already cloned, pulls latest and rewires wrappers.
 
 set -euo pipefail
 
@@ -16,11 +14,11 @@ say() { printf "${BLUE}>>${RESET} %s\n" "$*"; }
 ok()  { printf "${GREEN}ok${RESET} %s\n" "$*"; }
 warn(){ printf "${YELLOW}!!${RESET} %s\n" "$*"; }
 
-say "kya-broker bootstrap"
+say "kya-broker v1.0 bootstrap"
 say "  opt_dir   = $OPT_DIR"
 say "  local_dir = $LOCAL_DIR"
 
-# --- Python gate ---
+# Python gate
 if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 is required (Python >= 3.11). Install from python.org first." >&2
   exit 1
@@ -33,7 +31,7 @@ if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }
 fi
 ok "python $PY_VER"
 
-# --- Clone or update the repo ---
+# Clone or update
 if [ -d "$OPT_DIR/.git" ]; then
   say "repo already cloned — pulling latest"
   (cd "$OPT_DIR" && git pull --ff-only --quiet) && ok "updated" || warn "pull failed (working tree may have local changes)"
@@ -44,30 +42,22 @@ else
   ok "cloned"
 fi
 
-# --- Run install.sh (in the opt dir) ---
+# Install (creates venv + wires CLI wrappers)
 say "running install.sh"
 bash "$OPT_DIR/install.sh"
 
-# --- Hint next steps ---
+# Done
 echo
 say "next steps"
-echo "  1.  Add ~/.local/bin to PATH if it isn't already:"
+echo "  1.  Add ~/.local/bin to PATH (if not already):"
 echo "        export PATH=\"\$HOME/.local/bin:\$PATH\""
-echo "  2.  Lock your confirmation email (write-once, can't be changed):"
-echo "        broker email-lock <your-email@example.com>"
-echo "  3.  Run the interactive setup wizard:"
-echo "        broker setup"
-echo "  4.  Register the MCP server in Claude Code's config:"
-cat <<JSON
-        {
-          "mcpServers": {
-            "kya-broker": {
-              "command": "$HOME/.local/bin/kya-broker-mcp"
-            }
-          }
-        }
-JSON
-echo "  5.  Zero-config sanity check:"
-echo "        broker demo"
+echo "  2.  (Optional) Set spending caps:"
+echo "        broker budget --daily 50 --monthly 500"
+echo "  3.  Make sure 'Claude for Chrome' extension is installed + signed in"
+echo "        (chromewebstore.google.com → search 'Claude for Chrome')"
+echo "  4.  Save the v1.0 SKILL.md to your skill dir:"
+echo "        mkdir -p ~/.claude/skills/kya-broker"
+echo "        curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/SKILL.md \\"
+echo "          -o ~/.claude/skills/kya-broker/SKILL.md"
 echo
 ok "bootstrap complete."

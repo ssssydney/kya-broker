@@ -1,116 +1,141 @@
-"""Ledger CRUD and aggregation tests."""
+"""Tests for v1.0 thin ledger."""
 
 from __future__ import annotations
 
-from src.intent import Intent, IntentState
-from src.ledger import Ledger
+import pytest
+
+from src.ledger import Ledger, LedgerError
 
 
-def _intent() -> Intent:
-    return Intent(
-        merchant="vast.ai",
-        amount_usd=5.0,
-        rationale="small topup for an attention ablation run on 4090",
-        estimated_actual_cost_usd=4.5,
-    )
+def test_log_intent_returns_id():
+    led = Ledger()
+    intent_id = led.log_intent("vast.ai", 5.0, rationale="paper repro topup")
+    assert isinstance(intent_id, str) and len(intent_id) >= 32
 
 
-def test_insert_and_read():
-    ledger = Ledger()
-    intent = _intent()
-    ledger.insert_intent(intent, tier="L1")
-    row = ledger.get_intent(intent.intent_id)
+def test_log_intent_rejects_negative_amount():
+    led = Ledger()
+    with pytest.raises(LedgerError):
+        led.log_intent("vast.ai", -1.0)
+
+
+def test_log_intent_rejects_blank_merchant():
+    led = Ledger()
+    with pytest.raises(LedgerError):
+        led.log_intent("   ", 1.0)
+
+
+def test_log_intent_rejects_invalid_status():
+    led = Ledger()
+    with pytest.raises(LedgerError):
+        led.log_intent("vast.ai", 5.0, status="weird")
+
+
+def test_get_intent_round_trip():
+    led = Ledger()
+    intent_id = led.log_intent("openrouter.ai", 10.0, rationale="api top up")
+    row = led.get_intent(intent_id)
     assert row is not None
-    assert row["current_state"] == IntentState.PROPOSED.value
-    assert row["tier"] == "L1"
+    assert row["merchant"] == "openrouter.ai"
+    assert row["amount_usd"] == 10.0
+    assert row["status"] == "proposed"
 
 
-def test_transition_records_event():
-    ledger = Ledger()
-    intent = _intent()
-    ledger.insert_intent(intent, tier="L1")
-    ledger.transition(intent.intent_id, IntentState.AUDITED, reason="test")
-    row = ledger.get_intent(intent.intent_id)
-    assert row["current_state"] == IntentState.AUDITED.value
-    history = ledger.state_history(intent.intent_id)
-    # created event + 1 transition event
-    assert len(history) == 2
-    assert history[-1]["to_state"] == "audited"
+def test_update_intent_status():
+    led = Ledger()
+    intent_id = led.log_intent("vast.ai", 5.0)
+    led.update_intent(intent_id, status="settled", note="receipt 12345")
+    row = led.get_intent(intent_id)
+    assert row["status"] == "settled"
+    assert row["note"] == "receipt 12345"
 
 
-def test_invalid_transition_raises():
-    import pytest
-
-    ledger = Ledger()
-    intent = _intent()
-    ledger.insert_intent(intent, tier="L1")
-    from src.intent import InvalidTransitionError
-
-    with pytest.raises(InvalidTransitionError):
-        ledger.transition(intent.intent_id, IntentState.SETTLED)
+def test_update_unknown_intent_raises():
+    led = Ledger()
+    with pytest.raises(LedgerError):
+        led.update_intent("not-a-real-id", status="settled")
 
 
-def test_audit_record_and_fetch():
-    ledger = Ledger()
-    intent = _intent()
-    ledger.insert_intent(intent, tier="L1")
-    ledger.record_audit(
-        intent_id=intent.intent_id,
-        auditor_name="codex",
-        is_primary=True,
-        verdict="approve",
-        concerns=["scale looks fine"],
-        recommended_amount_usd=None,
-        latency_ms=1234,
-        input_tokens=100,
-        output_tokens=50,
-        raw_output='{"verdict":"approve"}',
-        model="gpt-5-codex",
-    )
-    audits = ledger.audits_for(intent.intent_id)
-    assert len(audits) == 1
-    assert audits[0]["verdict"] == "approve"
+def test_list_intents_orders_newest_first():
+    led = Ledger()
+    a = led.log_intent("a.com", 1.0)
+    b = led.log_intent("b.com", 2.0)
+    c = led.log_intent("c.com", 3.0)
+    rows = led.list_intents(limit=10)
+    assert [r["intent_id"] for r in rows] == [c, b, a]
 
 
-def test_execution_tracking():
-    ledger = Ledger()
-    intent = _intent()
-    ledger.insert_intent(intent, tier="L1")
-    ledger.start_execution(intent.intent_id, rail="crypto")
-    ledger.complete_execution(
-        intent.intent_id,
-        tx_hash="0xabc",
-        merchant_receipt_id="r-123",
-        actual_cost_usd=4.75,
-    )
-    ex = ledger.execution_for(intent.intent_id)
-    assert ex["tx_hash"] == "0xabc"
-    assert ex["actual_cost_usd"] == 4.75
+def test_budget_set_and_get():
+    led = Ledger()
+    led.set_budget("daily_cap_usd", 50.0)
+    led.set_budget("monthly_cap_usd", 500.0)
+    b = led.get_budget()
+    assert b["daily_cap_usd"] == 50.0
+    assert b["monthly_cap_usd"] == 500.0
 
 
-def test_spending_aggregation():
-    ledger = Ledger()
-    intent = _intent()
-    ledger.insert_intent(intent, tier="L1")
-    ledger.transition(intent.intent_id, IntentState.AUDITED)
-    ledger.transition(intent.intent_id, IntentState.EXECUTING)
-    ledger.transition(intent.intent_id, IntentState.SETTLED)
-    ledger.start_execution(intent.intent_id, rail="crypto")
-    ledger.complete_execution(intent.intent_id, actual_cost_usd=5.0)
-    assert ledger.spent_last_24h() == 5.0
+def test_budget_rejects_unknown_key():
+    led = Ledger()
+    with pytest.raises(LedgerError):
+        led.set_budget("yearly_cap_usd", 1000.0)
 
 
-def test_audit_comparison_shape():
-    ledger = Ledger()
-    intent = _intent()
-    ledger.insert_intent(intent, tier="L1")
-    ledger.record_audit(
-        intent.intent_id, "codex", True, "approve", [], None, 100, 10, 5, None, "m1"
-    )
-    ledger.record_audit(
-        intent.intent_id, "claude", False, "reject", ["differs"], None, 200, 10, 5, None, "m2"
-    )
-    rows = ledger.audit_comparison()
+def test_budget_rejects_negative_value():
+    led = Ledger()
+    with pytest.raises(LedgerError):
+        led.set_budget("daily_cap_usd", -1.0)
+
+
+def test_check_budget_no_caps_set_returns_ok():
+    led = Ledger()
+    ok, reason = led.check_budget(500.0)
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_check_budget_below_caps():
+    led = Ledger()
+    led.set_budget("daily_cap_usd", 50.0)
+    led.set_budget("monthly_cap_usd", 500.0)
+    ok, reason = led.check_budget(5.0)
+    assert ok is True
+
+
+def test_check_budget_exceeds_daily():
+    led = Ledger()
+    led.set_budget("daily_cap_usd", 10.0)
+    ok, reason = led.check_budget(15.0)
+    assert ok is False
+    assert "daily cap" in reason
+
+
+def test_check_budget_exceeds_monthly_after_settle():
+    led = Ledger()
+    led.set_budget("daily_cap_usd", 100.0)
+    led.set_budget("monthly_cap_usd", 20.0)
+    intent_id = led.log_intent("a.com", 15.0)
+    led.update_intent(intent_id, status="settled")
+    ok, reason = led.check_budget(10.0)
+    assert ok is False
+    assert "monthly cap" in reason
+
+
+def test_proposed_intents_dont_count_against_caps():
+    led = Ledger()
+    led.set_budget("daily_cap_usd", 10.0)
+    # Only `proposed` intents — nothing actually settled
+    led.log_intent("a.com", 5.0, status="proposed")
+    led.log_intent("b.com", 5.0, status="proposed")
+    # New $5 intent should still pass; only `settled` counts
+    ok, _ = led.check_budget(5.0)
+    assert ok is True
+
+
+def test_export_round_trip():
+    led = Ledger()
+    led.log_intent("vast.ai", 5.0)
+    led.set_budget("daily_cap_usd", 50.0)
+    rows = led.list_intents()
+    budget = led.get_budget()
     assert len(rows) == 1
-    assert rows[0]["codex_verdict"] == "approve"
-    assert rows[0]["claude_verdict"] == "reject"
+    assert budget["daily_cap_usd"] == 50.0

@@ -1,198 +1,97 @@
-# Architecture
+# v1.0 Architecture
 
-KYA-Broker (Know-Your-Agent Broker) is a Claude Code skill that lets the agent
-autonomously pay merchants on behalf of the user, without ever holding the
-user's private keys, card numbers, or passwords. This doc explains the pieces
-and the trade-offs.
+KYA-Broker v1.0 is **a Claude Code skill, not a payment processor**. It coordinates the agent + the user + the user's existing browser-stored credentials to complete payments. Almost all the real work is done by infrastructure that already exists:
 
-## Principals
+```
+┌──────────────────────────┐
+│  Claude Code (agent)     │
+│  reads SKILL.md          │
+└────────┬─────────────────┘
+         │  drives via Claude-in-Chrome MCP
+         ▼
+┌──────────────────────────┐         ┌──────────────────────────┐
+│  User's Chrome browser   │ ◀─────▶ │  User                    │
+│   • signed-in Google     │  yes/no │   - sees screenshots     │
+│   • saved passwords      │         │   - confirms in chat     │
+│   • saved cards (autofill)         │   - completes 3DS / OTP  │
+│   • Apple Pay / Google Pay         │   - is the only one      │
+└────────┬─────────────────┘         │     who can move money    │
+         │                            └──────────────────────────┘
+         │  HTTPS to merchant
+         ▼
+┌──────────────────────────┐
+│  Merchant + payment PSP  │
+│   • Stripe / Coinbase /  │
+│     PayPal / etc.        │
+│   • does KYC, AML, 3DS,  │
+│     fraud detection      │
+└──────────────────────────┘
+
+         (separate, optional, NEVER drives the browser)
+         ┌──────────────────────────┐
+         │  broker CLI (~150 lines) │
+         │   • SQLite ledger        │
+         │   • daily/monthly caps   │
+         └──────────────────────────┘
+```
+
+## Principals and what they do
 
 | Principal | Can do | Cannot do |
 |---|---|---|
-| Claude Code (agent) | propose intents, read ledger status | sign transactions, enter card numbers, move money |
-| Broker (this skill) | validate, persist, audit, drive Chrome up to the human gate | sign, type card data, bypass gates |
-| Auditor (Codex / Claude) | approve / reject intents, write verdicts | influence execution beyond the primary verdict |
-| Browser + human | sign in, enter cards, sign transactions, complete 3DS / OTP / magic links | propose intents, change policy |
+| Agent (Claude Code) | screenshot, navigate, click safe elements (radios, dropdowns, non-card text inputs), log to ledger | type card numbers, type passwords, type 3DS / OTP / CAPTCHA codes, click Submit without explicit user "yes" |
+| Chrome | autofill saved passwords + cards, present saved-card pickers, run 3DS challenge iframes | spend money on its own |
+| Merchant + PSP | tokenize cards (Stripe iframe), run fraud detection, settle transactions | proceed without user's authorization |
+| User | answer "yes / cancel" in chat, type 3DS codes / biometrics, install / remove saved cards | be bypassed |
+| `broker` CLI (optional) | record intents, enforce daily/monthly caps | drive any browser, send any network request |
 
-No single principal can move money without at least one human action at the
-rail's native authorization step.
+The chain "agent → chrome → merchant → bank" only completes when the user actively says yes in chat AND completes the bank's verification. Removing the user removes the entire payment capability.
 
-## The HumanGate primitive
+## What changed from v0.5
 
-The biggest design shift in v0.4: every rail collapses to the same primitive.
+v0.5 had an **independent broker process** that:
+1. Audited every intent via Codex (or Claude as fallback)
+2. Issued its own email OTP via SMTP
+3. Drove Chrome via raw CDP
+4. Used hand-written YAML playbooks per merchant × rail
+5. Stored a write-once email lock with SHA256 tamper detection
 
-```python
-class HumanGateRequest:
-    reason: "metamask_sign" | "card_details" | "card_3ds" | "email_magic_link"
-          | "email_otp" | "sms_otp" | "login" | "saved_card_confirm" | "passkey" | "generic"
-    prompt: str                     # user-facing explanation
-    timeout_seconds: int
-    on_completion: predicate        # checks DOM / URL / selectors
-    on_decline: predicate
-    optional: bool                  # skip if presence_check says "not present"
-    presence_check: predicate
-```
+This was **3500+ lines of Python** to replicate work that browsers and PSPs already do. It also introduced its own attack surface (SMTP creds in `.env`, popup server on localhost, brittle selectors).
 
-The broker calls `human_gate.wait_for_human(request)` and gets back
-`completed | declined | timeout | skipped`. Notification channels (terminal
-panel, macOS banner, say-aloud, custom callable) are pluggable.
+v1.0 deletes all of it. The principals chart above is the new model. The broker CLI is reduced to a SQLite logger + a budget gate, ~300 lines total. Everything else is pushed onto the agent's chat with the user, the browser's existing security, and the PSP's existing fraud detection.
 
-Every playbook step of the form `wait_for_human:` becomes one `HumanGateRequest`. The legacy `wait_for_metamask_popup` step from v0.3.1 is a thin alias.
+## What we keep
 
-## Playbook model
+- **Ledger (`broker log`, `broker history`)** — useful for the user to see what was attempted and when. Easy to add, hard to abuse.
+- **Caps (`broker budget`, `broker check-budget`)** — runaway-loop protection. The agent can be told to abort before clicking if a cap would be exceeded.
+- **Hard rules in SKILL.md** — the agent is instructed to never type card numbers, never type passwords, never auto-click 3DS, etc. These are enforced by the agent's own conduct, audited by the user reading the chat.
 
-A playbook is a YAML file that drives Chrome through a specific merchant × rail combination. For example, OpenRouter card vs OpenRouter crypto are two different files. The playbook schema:
+## What we drop (and why we're OK with it)
 
-```yaml
-name: openrouter_topup_card
-rail: card
+- **Cross-model audit (Codex audits Claude)** — the value here was catching prompt-injected intents before money moves. In practice, the user reading the screenshot + chat right before the click catches the same things. The audit was buying us "what if the user doesn't read carefully?", which is a much weaker security property than "the user explicitly types yes."
+- **Email OTP** — was a second factor, but factor 1 (Chrome unlocked) and factor 3 (3DS challenge for the actual card) already cover this. The middle factor was redundant.
+- **Email lock** — only meaningful if you have an email OTP layer. Gone with the OTP.
+- **Per-merchant playbooks** — replaced by `mcp__Claude_in_Chrome__find` + adaptive screenshotting. Works on any merchant, fails gracefully when the page is unfamiliar.
 
-preconditions:
-  - human-readable assertion
+## Threat model (what's protected, what's not)
 
-steps:
-  - goto: <url>                   # navigate
-  - wait_for: <description>       # placeholder sleep / DOM wait
-  - click_visual: <label>         # click element by visible text
-  - fill_amount: <usd>            # set amount input
-  - select_payment_method: <name> # click method radio / button
-  - wait_for_human:               # HumanGate — see above
-      reason: <reason>
-      prompt: <prompt>
-      detect_completion_keywords: [...]
-      detect_decline_keywords: [...]
-      timeout: 240s
-      optional: false
-      presence_keywords: [...]    # only used when optional=true
-  - wait_for_merchant_settlement: # poll until balance updates
-      expected_amount: "$N"
-      timeout: 300s
-  - record_outcome:
-      state: settled
-```
+**Protected** (i.e., the design defeats these):
 
-Template placeholders like `${{ intent.amount_usd }}` are interpolated from the
-Intent at execution time. Chrome-specific details (CSS selectors, XPath) are
-hidden behind the step types — the playbook stays merchant-level.
+- Agent gets prompt-injected to spend more / on a different merchant — caught by the user's "yes" gate before each click.
+- Agent loops and tries the same payment 100 times — caught by `broker check-budget` and the user noticing 100 chats.
+- Network MITM modifies a checkout page — Chrome's HTTPS + PSP iframes' cross-origin sandboxing prevent this.
+- Agent's process is compromised — Chrome's password manager is in another process; the compromised process can't read it.
 
-## Intent lifecycle
+**NOT protected** (don't use this skill if these matter):
 
-```
-            propose_intent
-                │
-                ▼
-          ┌──────────┐   audit reject    ┌──────────┐
-          │ proposed │ ──────────────▶  │ rejected │
-          └──────────┘                  └──────────┘
-                │ audit approve
-                ▼
-          ┌──────────┐
-          │ audited  │
-          └──────────┘
-           │        │
-           │ L0     │ L1
-           ▼        ▼
-      ┌──────────┐ ┌──────────────┐
-      │ executing│ │awaiting_user │
-      └──────────┘ └──────────────┘
-                        │ resume (user confirmed)
-                        ▼
-                  ┌──────────┐
-                  │executing │
-                  └──────────┘
-                  │   │   │   │
-         settled  │  user_declined
-                  │   │
-                  │ failed / playbook_broken
-```
+- Adversary has physical access to your unlocked Mac → they can do anything Chrome can. Not specific to this skill.
+- Adversary has `~/.claude/skills/kya-broker.local/ledger.sqlite` → they can read / tamper with payment history (but not cause new payments).
+- Adversary has socially engineered the user into typing "yes" → no skill can defeat that.
+- Card-not-present fraud against the user's saved card → that's the bank / PSP's job, and they have their own systems.
 
-Terminal states: `settled`, `rejected`, `user_declined`, `failed`, `playbook_broken`, `expired`.
+## Operational notes
 
-## Rail selection
-
-`select_rail(cfg, intent)` walks candidates in this order:
-
-1. `intent.rail_hint` if set and the user has a matching enrolled method.
-2. Merchant's declared `preferred_rail`.
-3. `cfg.rails` (user-defined preference list), filtered to rails the user has enrolled AND the merchant has a playbook for.
-
-If none match, raises `RailUnavailableError` with a human-readable breakdown
-of why each candidate was rejected.
-
-## Why dual auditor?
-
-An agent that's vulnerable to prompt injection may also be able to fool an
-auditor drawn from the same model family. Codex (GPT family) and Claude
-(Anthropic family) are trained on overlapping but distinct corpora; using
-Codex as primary + Claude as shadow is the closest thing to a cross-source
-security review.
-
-Shadow mode (`audit.shadow_mode: true`) runs both models on every intent for
-A/B data. `broker analyze-audits` computes per-intent verdict agreement and
-can export CSV for offline analysis.
-
-## Why the human gate is physically unbypassable
-
-Earlier drafts had elaborate L0/L1/L2 passkey stacks. v0.3 retired those in
-favor of "whatever the rail already makes the human do":
-
-- **Credit card:** Stripe's iframe is sandboxed and only accepts input from
-  the user's keyboard / autofill; the broker cannot type into it (cross-origin)
-  and cannot click Pay without the card being filled.
-- **3DS:** the bank's challenge frame is a second sandbox. Same story.
-- **MetaMask:** the extension popup is a browser-level UI outside the page's
-  scripting surface.
-- **Email magic-link:** the link goes to a URL only the user's inbox holds.
-  Even if the broker had read access to the inbox (it doesn't), the flow is
-  designed around the human clicking.
-- **SMS OTP:** the OTP is on a second device.
-
-In each case, the "attacker model" (a compromised or prompt-injected Claude Code) cannot complete the authorization. The broker presents the moment; the user (or no one) decides.
-
-## File layout
-
-```
-~/.claude/skills/kya-broker/           # read-only, git-pullable
-├── SKILL.md
-├── policy.default.yaml
-├── playbooks/
-│   ├── openrouter_topup_card.yaml
-│   ├── openrouter_topup_crypto.yaml
-│   ├── vast_topup_crypto.yaml
-│   ├── vast_topup_card.yaml
-│   └── anthropic_topup_card.yaml
-├── prompts/
-│   ├── audit_system.md
-│   ├── audit_codex.md
-│   ├── audit_claude.md
-│   └── chrome_agent.md
-└── src/
-    ├── intent.py              # data model + state machine (+ rail_hint)
-    ├── ledger.py              # SQLite, schema v3 adds rail_hint column
-    ├── auditor/…              # Codex + Claude + runner
-    ├── broker.py              # orchestrator
-    ├── chrome_bridge.py       # CDP + dry-run; speaks HumanGate
-    ├── human_gate.py          # HumanGate primitive + notifiers
-    ├── rail_selector.py       # now rail-agnostic
-    ├── config.py              # payment_methods, merchants.playbooks map
-    ├── mcp_server.py          # stdio MCP
-    ├── cli.py                 # `broker` CLI
-    └── setup_wizard.py        # interactive enrollment
-
-~/.claude/skills/kya-broker.local/     # user state, never committed
-├── ledger.sqlite
-├── config.yaml
-├── .env
-├── dumps/       # DOM + screenshots on playbook failure
-└── logs/
-```
-
-## What's NOT in v0.4
-
-- Bank transfer (ACH / SEPA). Reserved for v0.5+.
-- Bulk / recurring topups without per-intent audit. The cost / benefit doesn't
-  favor auto-recurring for a skill that aims to surface every spend.
-- Multi-machine coordination with the same card / wallet. Doable but out of
-  scope; keep one broker per payment method.
-- Anti-phishing on the user's Chrome profile. If you install malicious
-  extensions, we can't protect you — setup reminds you to use a clean profile.
+- The skill works on any merchant the user has visited before in Chrome. No allowlist, no playbook PRs.
+- If a merchant is fully new to the user (no saved password, no saved card), the agent stops and tells the user to establish the relationship themselves first. The skill is for repeat purchases, not first-time sign-ups.
+- For high-stakes (>$1000) flows, the SKILL.md tells the agent to suggest the user complete the payment themselves rather than via the agent. There's no enforcement on amount aside from the user's own caps; this is a soft norm, not a hard limit.
+- When 3DS / OTP / biometric is needed, the agent surfaces the moment and waits. It does not poll a PSP API (we don't have one). It just re-screenshots the page periodically and watches for success / failure text.

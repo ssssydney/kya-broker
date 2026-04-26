@@ -1,162 +1,117 @@
-# KYA-Broker
+# KYA-Broker v1.0 — browser-native agent payment skill
 
-**A generic agent-payment skill for Claude Code.** Clone it into `~/.claude/skills/`, run one setup wizard, and your Claude Code can top up whatever merchant you allowlist — **OpenRouter, vast.ai, Anthropic, and anything else with a playbook** — using your existing human payment methods (credit card, MetaMask, email-authorised accounts). The skill drives the browser up to the card / wallet / OTP step, then hands over and waits. It never sees card numbers, passwords, or private keys.
+**A Claude Code skill that lets agents complete payment workflows on any merchant the user has previously interacted with.** It does this by driving the user's Chrome via the Claude-in-Chrome MCP — using saved passwords, autofilled cards, and saved checkout methods that the user has already approved. The skill never touches card numbers, passwords, or 3DS / OTP codes; those are the user's exclusively, handled by Chrome and the merchant's checkout.
 
-- ✦ **Rail-agnostic.** Credit card (Stripe / Chrome autofill / 1Password / Apple Pay), crypto (MetaMask USDC), email magic links, 3D-Secure challenges, SMS OTP — all reduce to the same "HumanGate" primitive.
-- ✦ **Portable.** macOS / Linux + Python 3.11+ + Chrome. No per-user server, no device-bound keys.
-- ✦ **Safe by default.** Independent Codex auditor reviews every intent; cross-model-family audit hedges against Claude-auditing-Claude shared biases. Shadow mode runs Codex and Claude in parallel for A/B research.
-- ✦ **Observable.** SQLite ledger with full state history, audit verdicts, tx hashes and receipts. Export via `broker export-logs`.
-- ✦ **Research-ready.** Shadow mode gives you Codex-vs-Claude verdict data on real intents via `broker analyze-audits`.
+> **Status:** v1.0 — radically simplified. v0.5 had its own audit layer + email lock + SMTP popup + per-merchant playbooks (~3500 lines of Python). v1.0 trusts Chrome + payment processors instead and is ~300 lines. v0.5 is preserved at git tag `v0.5` for reference.
 
-> **Status:** v0.4 — generic payment rails. Previous v0.3.1 was MetaMask/vast-only; this release lifts the HumanGate abstraction to cover credit cards, 3DS, email links, and MetaMask uniformly. 51 tests passing.
-
-## 5-minute quickstart
+## Quickstart
 
 ```bash
-# 1. Clone into the Claude Code skills directory
-git clone <this-repo> ~/.claude/skills/kya-broker
-cd ~/.claude/skills/kya-broker
+# One-line install
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/bootstrap.sh)"
 
-# 2. Install deps + wrapper scripts
-bash install.sh
-
-# 3. Make sure ~/.local/bin is on PATH
-export PATH="$HOME/.local/bin:$PATH"
-
-# 4. Run the wizard (audit layer, enroll methods, allowlist merchants, thresholds)
-broker setup
-
-# 5. Smoke-test
-broker check-balance
+# Drop SKILL.md into Claude Code's skills directory
+mkdir -p ~/.claude/skills/kya-broker
+curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/SKILL.md \
+  -o ~/.claude/skills/kya-broker/SKILL.md
 ```
 
-The `kya-broker` skill auto-registers when the repo lives at `~/.claude/skills/kya-broker/` (Claude Code reads `SKILL.md`).
+Required: Python 3.11+, Chrome with the **Claude for Chrome** extension installed and signed in.
 
-## Architecture at a glance
+That's it. No SMTP, no email lock, no API keys, no setup wizard.
+
+## How it works
 
 ```
-┌──────────────────┐  propose_intent  ┌─────────────────────┐
-│  Claude Code     │ ───────────────▶ │   broker (Python)   │
-│  (agent session) │                  │  intent + ledger    │
-└──────────────────┘                  └──────────┬──────────┘
-                                                 │ audit
-                                                 ▼
-                                       ┌─────────────────────┐
-                                       │ Codex  (primary)    │ ← independent
-                                       │ Claude (shadow/fb)  │   model family
-                                       └──────────┬──────────┘
-                                                  │ approved + L0/L1 gate
-                                                  ▼
-                                       ┌─────────────────────┐
-                                       │ Chrome (user's)     │
-                                       │ ── navigate, fill   │
-                                       │ ── HumanGate ──────┐│
-                                       └──────────┬──────────┘│
-                                                  │           │
-                              (card / MetaMask / email / OTP) │
-                                                  │           │
-                                                  ◀───────────┘
-                                                  │ receipt + tx hash
-                                                  ▼
-                                       ┌─────────────────────┐
-                                       │ merchant credit +$N │
-                                       │  (OpenRouter / vast │
-                                       │   / Anthropic …)    │
-                                       └─────────────────────┘
+Claude Code (agent)
+    │
+    │ "user wants to top up vast.ai $5"
+    │
+    ├── confirm intent in chat with user ──→ user says "go"
+    │
+    ├── (optional) broker check-budget 5    ──→ ok / abort
+    ├── (optional) broker log --merchant vast.ai --amount 5 ──→ intent_id
+    │
+    ├── Claude-in-Chrome MCP drives browser
+    │     navigate → fill amount → pick saved card → screenshot
+    │
+    ├── show screenshot to user, ask "go?" ──→ user says "go"
+    │
+    ├── click Submit
+    │
+    ├── handle 3DS / OTP if it appears ──→ "complete in browser, I'll wait"
+    │
+    ├── verify settlement page
+    │
+    └── (optional) broker update <intent_id> --status settled
 ```
+
+Browser does the work. User has the final say at every money-moving moment. Skill is a coordinator, not a payment processor.
+
+## Why v1.0 ditched v0.5's architecture
+
+v0.5 added a Codex/Claude cross-model audit, an email-OTP popup with SMTP delivery, a write-once email lock, and per-merchant playbook YAMLs. We removed all of it because:
+
+- **Identity** — Chrome being unlocked + the user being at the keyboard is sufficient evidence the user is present. We don't need a second OTP channel.
+- **Authorization** — saved cards in Chrome / 1Password / Apple Pay = previously approved. The user's "yes" in chat right before the click = approved now.
+- **Fraud detection** — Visa, Mastercard, Stripe Radar, the issuing bank are all already doing this for every transaction. Adding our own audit didn't add anything they don't catch better.
+- **Brittle selectors** — every merchant UI change broke a playbook. With Claude-in-Chrome MCP's `find` and `screenshot`, the agent reads the page adaptively.
+
+The result: less code, less setup, fewer failure modes, broader merchant coverage (any site the user has used before, not just ones with a YAML).
+
+What we lose: the cross-model-family audit. Acceptable for everyday top-ups under $100 against merchants with their own fraud detection.
 
 ## CLI reference
 
 | Command | What it does |
 |---|---|
-| `broker setup` | Interactive wizard: audit, payment-method enrollment, merchant allowlist, thresholds |
-| `broker propose-intent intent.json [--context-file ctx.json]` | Submit an intent (same schema as the MCP tool) |
-| `broker status <intent_id>` | State machine + audits + execution + human-gate history |
-| `broker check-balance` | Spending caps + Chrome-attached wallet balance |
-| `broker history [--limit N] [--format pretty|json]` | Recent intents |
-| `broker resume <intent_id>` | Resume after a human-gate in awaiting_user |
-| `broker analyze-audits [--since YYYY-MM-DD]` | Codex vs Claude verdicts (shadow mode) |
-| `broker export-logs out.json` | Dump the full ledger for offline research |
+| `broker log --merchant M --amount N [--rationale TEXT] [--status STATUS]` | Record an attempt; returns intent_id |
+| `broker update <intent_id> --status STATUS [--note TEXT]` | Update an attempt |
+| `broker history [--limit N] [--format pretty\|json]` | Recent attempts |
+| `broker budget [--daily N] [--monthly N]` | Get / set caps |
+| `broker check-budget <amount>` | exit 0 if amount fits; non-zero if it'd exceed caps |
+| `broker export out.json` | Full ledger dump |
 
-## Payment methods
+The CLI never drives a browser, sends an email, or contacts an external API. It only manages a SQLite ledger at `~/.claude/skills/kya-broker.local/ledger.sqlite`.
 
-Declared in `config.yaml`:
+## Configuration
 
-```yaml
-payment_methods:
-  - name: "research visa"
-    rail: card
-    last4: "4242"
-    notes: "chrome autofill profile 'work'"
-    max_auto_execute_usd: 20.00
+Set spending caps once via the CLI:
 
-  - name: "metamask main"
-    rail: crypto
-    wallet_address: "0xabc…def"
-    notes: "MetaMask · Polygon · USDC"
-
-  - name: "email magic-link"
-    rail: email_link
-    notes: "warrenzhong666@gmail.com"
+```bash
+broker budget --daily 50 --monthly 500
 ```
 
-The skill stores only labels / last-4 / wallet-address — never full card numbers or seeds. The actual fill / sign happens in the browser, out of the skill's reach.
+Both are optional. Without them, no cap is enforced.
 
-## Merchants shipped with defaults
+## Migration from v0.5
 
-| Merchant | Rails | Playbook(s) |
-|---|---|---|
-| openrouter.ai | card, crypto | `openrouter_topup_card.yaml`, `openrouter_topup_crypto.yaml` |
-| vast.ai | crypto, card | `vast_topup_crypto.yaml`, `vast_topup_card.yaml` |
-| anthropic.com | card | `anthropic_topup_card.yaml` |
+If you used v0.5:
 
-Add your own with [docs/playbook_authoring.md](docs/playbook_authoring.md). Each new merchant is a YAML file + an entry in `config.yaml` → `merchants:`.
+```bash
+# Your ledger and config are in ~/.claude/skills/kya-broker.local/
+# v1.0 uses a new ledger schema; the v0.5 SQLite file is preserved untouched
+# but v1.0's `broker` commands won't see v0.5 intents.
 
-## Audit layer
+# To start fresh under v1.0:
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/bootstrap.sh)"
 
-```yaml
-audit:
-  primary: codex | claude | auto
-  shadow_mode: false
-  fallback_on_primary_failure: false
-  timeout_seconds: 30
+# v1.0 ledger lives at .local/ledger.sqlite (new schema, separate from v0.5's audit_results / human_gates / etc.)
 ```
 
-Codex is recommended as primary because it's from a different model family than Claude Code; same-family audit (Claude audits Claude) shares training biases. Shadow mode runs both auditors on every intent and writes both verdicts to the ledger for A/B analysis.
+The email lock, SMTP creds, and playbooks from v0.5 are no longer used and can be ignored or deleted from `kya-broker.local/`. The `.env` file is no longer needed.
 
-## The L0 / L1 / L2 gate
-
-```
-L0  amount ≤ l0_ceiling_usd  → audit only, auto-execute (rail gate still runs)
-L1  amount ≤ l1_ceiling_usd  → audit + explicit human gate (card/sign/OTP)
-L2  amount  > l1_ceiling_usd → broker refuses; ask human out of band
-```
-
-Note: even at L0, card / crypto / email_link rails always require a human gate at the rail level (you still have to type the CVV or sign the tx). L0 just means the broker doesn't block on an additional confirmation step beyond the rail's own.
-
-## FAQ
-
-**Does this store my credit card?** No. The card number is typed into the merchant's Stripe iframe by you (or autofilled from Chrome / 1Password / Apple Pay). The broker sees only last-4 / expiry via DOM inspection after payment, if at all.
-
-**Does this touch my MetaMask seed phrase?** No. MetaMask unlocks with your password inside the extension; the broker never sees it.
-
-**What if a merchant adds 2FA mid-checkout?** Most flows (3DS, SMS OTP, email link) are already modeled as optional HumanGates. The broker detects them, fires a gate, waits. If you hit a novel gate we don't recognise, it'll timeout and mark `playbook_broken` — file a PR with a new `wait_for_human` step.
-
-**Can I use saved cards / Apple Pay / Google Pay?** Yes. The broker doesn't care how the card field gets filled — browser autofill, 1Password, Apple Pay, manual typing are all fine from its perspective. The completion detector just watches for success text.
-
-**Can two machines share one card?** Yes, but be careful with duplicate charges. Each intent creates one charge at its own merchant; there's no shared state between machines, so don't auto-propose the same intent from two machines simultaneously.
-
-**Uninstall?** `bash uninstall.sh` removes wrappers. Ledger + config stay in `~/.claude/skills/kya-broker.local/` — delete that folder to wipe history.
+See [docs/migration.md](docs/migration.md) for details.
 
 ## Development
 
 ```bash
+git clone https://github.com/ssssydney/kya-broker
+cd kya-broker
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest tests/   # ~51 tests, ~1.5s
+.venv/bin/python -m pytest tests/
 ```
-
-Tests run in a tmpdir sandbox (`tests/conftest.py`) and force `KYA_BROKER_DRY_RUN=1` — no browser, no real API calls.
 
 ## License
 

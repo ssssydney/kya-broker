@@ -1,268 +1,241 @@
 ---
 name: kya-broker
-description: Generic agent-payment skill. Use this when the user asks Claude Code to autonomously top up credits at an allowlisted merchant (OpenRouter API credits, vast.ai GPU rental, Anthropic API credits, and any merchant with a registered playbook) using their own credit card, crypto wallet, or email-linked account. Trigger only on explicit "pay / top up / buy credits / run this paid job" requests. DO NOT trigger for general coding help, research reading, or tasks that don't need money. Before using this skill in a conversation, always ask the user to confirm their email address; once locked that address is immutable.
+description: Browser-native agent payment skill. Use when the user asks Claude Code to make a paid action on the web (top up credits at any merchant, pay a subscription, complete a checkout, etc.) AND the user has previously interacted with that merchant in their Chrome browser (saved password, autofilled card, or saved checkout method). Trigger on explicit "pay / top up / buy / charge / 充值 / 付款 / 支付" requests. Do NOT trigger for general coding help, research reading, or any task that doesn't involve money. Before any money-moving click, you must show the user a screenshot of what's about to happen and get an explicit "yes" in chat.
 ---
 
-# KYA Broker — Agent Payment Skill (v0.4)
+# KYA Broker — Browser-Native Payment Skill (v1.0)
 
-This skill lets you pay merchants on the user's behalf using their human
-payment methods (cards, MetaMask, email-auth accounts). You drive the browser
-up to the card / wallet / signature step, surface that step to the user in a
-local popup window, and wait. You never handle card numbers, passwords, or
-private keys directly. Every intent is independently audited (Codex preferred)
-before money moves, and every execution requires a broker-issued email OTP to
-the user's locked confirmation email as a final authorization floor.
+You drive the user's Chrome via the **Claude-in-Chrome MCP** to complete payment workflows on any merchant where the user has an existing account and saved payment methods. You do NOT touch card numbers, passwords, or seed phrases — Chrome's own password manager and saved-payments features handle those, and the merchant's checkout (Stripe / PayPal / etc.) handles the actual transaction. Your job is to drive the browser up to the human-verification moment, surface that moment to the user, and stop.
 
-Full source, playbooks, and docs: **https://github.com/ssssydney/kya-broker**
+Source / updates: **https://github.com/ssssydney/kya-broker**
 
 ---
 
-## 0. Bootstrap on first use (one-time, ~90 seconds)
+## 0. Philosophy (read this first)
 
-Before proposing any intent, verify the broker CLI is installed.
+Earlier versions of this skill (v0.3-v0.5) added a custom audit layer, an email OTP popup, a write-once email lock, an SMTP relay, and per-merchant playbook YAMLs. **All of that has been removed.** It was reinventing infrastructure that browsers and payment companies already do better:
 
-```bash
-broker --version 2>/dev/null || true
-```
+- **Identity** is solved by Chrome being unlocked + Google Account being signed in. If the user is at their unlocked Mac with Chrome open, they ARE the user.
+- **Saved passwords** for site logins are managed by Chrome's password manager (or 1Password, Bitwarden — whatever the user uses).
+- **Saved payment methods** are managed by Chrome autofill, Apple Pay, Google Pay, and the merchant's own card-on-file storage. They've done the KYC.
+- **Fraud detection** is done by the issuing bank (3DS), the network (Visa/MC), and the merchant (Stripe Radar).
+- **Final authorization** is the user clicking Pay or completing 3DS, which the broker physically cannot do.
 
-If the command isn't found OR returns no version, install via:
+The only thing this skill adds on top of "Claude drives a browser" is:
 
-```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/bootstrap.sh)"
-```
+1. **Friction at money-moving moments** — you must screenshot and ask the user "yes" in chat before clicking Submit / Pay / Confirm.
+2. **A local ledger** (optional, via the `agentpay` CLI) — so the user can see history and enforce daily/monthly caps.
+3. **A clear set of hard rules** for what you do and don't touch in the browser.
 
-This clones the full project into `~/.local/opt/kya-broker/`, creates a
-virtualenv, installs the `broker` / `kya-broker-mcp` / `kya-broker-setup`
-wrappers into `~/.local/bin/`, and initialises the SQLite ledger. It does
-NOT overwrite this `SKILL.md` — the user's standalone file stays as-is.
-
-After the bootstrap completes, verify:
-
-```bash
-broker --version          # should print "broker, version 0.4.x" or later
-```
-
-Register the MCP server in Claude Code's config **once**:
-
-```json
-{
-  "mcpServers": {
-    "kya-broker": {
-      "command": "/Users/<you>/.local/bin/kya-broker-mcp"
-    }
-  }
-}
-```
+That's it. Keep it minimal.
 
 ---
 
-## 1. Email lock protocol (CRITICAL — read every conversation start)
+## 1. Bootstrap (one-time, ~30 seconds)
 
-The broker sends an OTP to the user's **locked confirmation email** before
-every payment. That email is write-once: once set, it cannot be changed until
-the user manually runs `broker email-lock --reset` from their terminal. This
-is on purpose — a prompt-injected agent must not be able to silently reroute
-OTPs to an attacker's inbox.
+The `agentpay` CLI is optional but useful for spending caps + history. To install:
 
-**At the start of any conversation that might use this skill**, before
-proposing any intent, you MUST:
+```bash
+broker --version 2>/dev/null || \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/bootstrap.sh)"
+```
 
-1. Call the MCP tool `email_lock_status`:
-   ```
-   tool: email_lock_status
-   arguments: {}
-   ```
+After install, `broker` is available on PATH. If you can't or don't want to install, you can still use this skill — just skip steps that mention `broker`.
 
-2. If `{"locked": true, "email": "..."}`:
-   - Confirm with the user: "I'll send payment confirmation codes to
-     `<email>`. Is that still the address you want?"
-   - If the user says **anything** other than yes, STOP. They want a
-     different email, which requires `broker email-lock --reset` —
-     tell them to run that themselves.
-   - If yes, proceed.
-
-3. If `{"locked": false}`:
-   - Ask the user: "Which email should the broker send payment
-     confirmation codes to? This gets locked for this install and can't be
-     changed without explicit terminal action later."
-   - Once they answer, call `email_lock_set` with their address:
-     ```
-     tool: email_lock_set
-     arguments: {"email": "user@example.com"}
-     ```
-   - Confirm back: "Locked `user@example.com` for this install. The broker
-     will send codes there before every payment."
-
-If step 3's `email_lock_set` errors with `email_lock_error`, the email is
-invalid — ask the user for a syntactically valid address and retry.
-
-Never use this skill without first completing the email lock check. If the
-user refuses to provide an email, decline to use the skill and explain why.
+You also need the **Claude for Chrome** browser extension installed and signed in for `mcp__Claude_in_Chrome__*` tools to work. If `mcp__Claude_in_Chrome__list_connected_browsers` returns `[]`, ask the user to install it from `https://chromewebstore.google.com/` (search "Claude for Chrome") and sign in.
 
 ---
 
 ## 2. When to use this skill
 
-Trigger when the user asks you to:
+Trigger when the user asks for:
 
-- Top up OpenRouter / Anthropic / other LLM-API credits so you can keep calling them
-- Top up vast.ai / Lambda / RunPod GPU credits for an experiment
-- Complete a paid workflow end-to-end (topup + actual task) without the user babysitting every step
+- "Top up X dollars / credits at Y merchant" (vast.ai, OpenRouter, Anthropic, Replicate, …)
+- "Pay for / renew this subscription"
+- "Buy / order this thing on Amazon / Taobao / etc."
+- Any web checkout where the user **already has an account** and **already has a payment method on file** in Chrome or with that merchant.
 
 Do NOT trigger when:
 
-- The user is asking a general question; no payment is implied
-- The merchant isn't in `config.yaml` → merchants (run `broker history` to see recent merchants; ask the user to add if needed)
-- Existing merchant balance already covers the task (always check `broker check-balance` first)
+- The user is asking a question or doing research
+- The merchant is unfamiliar (newly registered domain, no Chrome saved credentials, user hasn't used it before)
+- The user explicitly says not to make payments
+- The flow requires **entering NEW card details for the first time** (the user should do that themselves; you don't type card numbers, ever)
 
 ---
 
-## 3. The generic pattern
+## 3. The workflow
 
-Every rail (card, crypto, email-link) reduces to the same shape:
+### Step 1 — Intent confirmation (in chat, before any browser action)
 
-```
-1. Broker drives Chrome to the merchant's checkout page
-2. Broker fills the amount + picks the method
-3. Local popup window opens: email OTP (always fires first)
-   ── user pastes the 6-digit code from their inbox
-4. Chrome flow continues to the rail's own authorization step:
-   ── card: user enters card in Stripe iframe (via autofill / 1Password /
-      Apple Pay / manual) — the broker does NOT type card numbers
-   ── crypto: MetaMask extension popup — user clicks Confirm
-   ── email_link: user clicks a magic link the merchant emailed
-5. Optional second gate for 3DS / SMS OTP if the card issuer requires it
-6. Merchant settles; broker records the receipt in the ledger
-```
+Confirm with the user **in chat** before opening the browser:
 
-Authorization tiers:
+> "I'm going to: (a) navigate to **<merchant>**, (b) sign you in if needed, (c) start a top-up of **\$<amount>** using your saved payment method. Confirm?"
 
-| Tier | Amount | What you need from the user |
-|---|---|---|
-| L0 | ≤ `l0_ceiling_usd` (default $2) | Audit approve + email OTP only. No rail human-click needed for MetaMask auto-unlock; card / MetaMask / magic-link always need a human moment. |
-| L1 | ≤ `l1_ceiling_usd` (default $50) | Audit + email OTP + explicit rail gate |
-| L2 | > `l1_ceiling_usd` | Broker refuses — you must ask the user for out-of-band approval before submitting |
+Do not start the browser flow until they say yes (or equivalent). If the user has set spending caps via `broker budget`, run `broker check-budget <amount>` first; if it fails, surface the cap to the user before asking for confirmation.
 
----
+### Step 2 — Drive the browser
 
-## 4. Workflow
+Use these MCP tools:
 
-1. **Check the email lock** (see section 1). Done once per conversation.
-2. **Read the user's request.** Pull out merchant, what they want to buy, rough budget.
-3. **Check balance.** `broker check-balance`. If credit already covers the task, skip to use.
-4. **Propose intent.** Call `propose_intent` (MCP) or `broker propose-intent intent.json --context-file ctx.json` (CLI) with a JSON payload (schema below). Include `rail_hint` when you have a preference.
-5. **Handle the response state.**
-   - `state: settled` — intent auto-executed (L0 with user having enrolled a compatible payment method). Proceed with the task.
-   - `state: awaiting_user` — the broker is waiting for the email OTP + rail-gate sequence. Tell the user: "The broker will send a 6-digit code to `<locked email>` and open a popup window. After you confirm, the browser will drive to the checkout page." Then call `broker resume <intent_id>`.
-   - `state: rejected` — audit rejected. Do NOT retry with a tweaked rationale just to "get it through" — the auditor saw a real problem. Tell the user the concerns and ask how to proceed.
-   - `state: failed` / `playbook_broken` — surface the error; do not try another rail silently.
-   - `state: user_declined` — user rejected in popup / MetaMask / browser. Do NOT retry silently. Ask why.
-6. **Use the credit.** Make the API calls, run the job — whatever the user originally asked for.
+- `mcp__Claude_in_Chrome__list_connected_browsers` — confirm Chrome is connected
+- `mcp__Claude_in_Chrome__select_browser` — pick the user's Chrome (use `isLocal: true`)
+- `mcp__Claude_in_Chrome__tabs_context_mcp` — get the MCP tab group
+- `mcp__Claude_in_Chrome__tabs_create_mcp` — make a fresh tab for this conversation
+- `mcp__Claude_in_Chrome__navigate` — go to the merchant's page
+- `mcp__Claude_in_Chrome__read_page` — inspect interactive elements (refs)
+- `mcp__Claude_in_Chrome__find` — locate elements by natural language
+- `mcp__Claude_in_Chrome__computer` — `screenshot`, `left_click`, `type`, `scroll` etc.
 
----
+Always create a new tab for the payment flow — don't reuse the user's existing tabs.
 
-## 5. MCP tool reference
+### Step 3 — Login (if needed)
 
-- `email_lock_status` — returns `{locked, email?, tampered?}`. Call at the top of every conversation.
-- `email_lock_set({email})` — set the confirmation email (write-once). Errors if a different one is already locked.
-- `propose_intent({merchant, amount_usd, rationale, estimated_actual_cost_usd, references?, rail_hint?, context?})` — submit a payment intent.
-- `get_status({intent_id})` — state machine + audits + execution + gate history.
-- `get_history({limit?})` — recent intents in reverse-chronological order.
-- `check_balance()` — wallet balance (when Chrome attached) + spending caps + 24h / 30d spend.
+If you land on a sign-in page:
 
-Equivalent CLI commands (same semantics): `broker email-lock`, `broker propose-intent`, `broker status`, `broker history`, `broker check-balance`, `broker resume`.
+- **Google OAuth button visible?** Click it — Chrome will use the signed-in Google account automatically.
+- **Email + Password fields?** Click into the email field; if Chrome's password manager has saved credentials, an autofill suggestion appears — click it. The fields populate automatically. Click sign in.
+- **Neither autofills nor has a Google option?** STOP. Ask the user to sign in manually in the tab, then say "ok ready" before continuing.
+- **2FA / OTP screen?** STOP. Ask the user to complete it in the tab, then say "ready".
 
----
+You never type a password directly. You never type a 2FA code.
 
-## 6. Intent schema (v1.1)
+### Step 4 — Fill the checkout form
 
-```json
-{
-  "merchant": "openrouter.ai",
-  "amount_usd": 10.0,
-  "rationale": "Need $10 OpenRouter credit to call gpt-4o-mini for the paper-reproduction pipeline — 25 calls * 2M input tokens @ $0.15/M + matching output = ~$6, with 40% buffer.",
-  "estimated_actual_cost_usd": 6.0,
-  "references": ["scripts/run_pipeline.py", "papers/attention-sink.pdf"],
-  "rail_hint": "card"
-}
+Once on the checkout / top-up page:
+
+- **Amount field** — type the amount the user authorized.
+- **Payment method radio** — click the saved card / saved payment method (e.g., "VISA…3497"). **Never click "Add new card" or any flow that requires typing a card number.** If no saved method is visible, STOP and tell the user to add one manually first.
+- **Avoid clicking Submit / Pay / Confirm yet.**
+
+### Step 5 — Screenshot + final confirm in chat
+
+Take a screenshot of the form in its final state with `screenshot` action. Show the user:
+
+> "About to charge **\$<amount>** to **<saved method>** on **<merchant>**. <screenshot>. Confirm with 'go' to proceed, or 'cancel'."
+
+Do not click Submit until they reply with an explicit "go" / "yes" / "confirm" / "proceed" or equivalent. **Anything ambiguous = cancel.**
+
+If the user has the `broker` CLI installed, log the attempt before clicking:
+
+```bash
+broker log --merchant <m> --amount <a> --rationale "<short reason>" --status proposed
 ```
 
-Field notes:
+This returns an `intent_id` you'll use to update status later.
 
-- `merchant` — must match an entry in the user's config merchant allowlist exactly.
-- `amount_usd` — what you're asking the broker to charge. Should be ≥ `estimated_actual_cost_usd` (a small buffer is fine; 2-3× is suspicious).
-- `rationale` — written for a skeptical auditor: specific references to the task, rough math backing the amount, why this merchant. Avoid generic boilerplate.
-- `estimated_actual_cost_usd` — your honest estimate of what the task will actually cost.
-- `references` — file paths / URLs backing the rationale. The auditor cross-references these with your context.
-- `rail_hint` — optional. One of `card`, `crypto`, `email_link`, `bank_transfer`. Omit to let the broker pick per the user's preferences.
+### Step 6 — Submit
 
----
+Click the Pay / Submit / Confirm button. Take a screenshot immediately after.
 
-## 7. Hard rules
+### Step 7 — Handle verification gates
 
-1. **Never** propose an intent with `amount_usd > policy.l1_ceiling_usd` without asking the user first. The broker will refuse and you'll have wasted a round trip.
-2. **Never** put secrets (API keys, wallet seeds, card numbers) into intent fields — they're forwarded to the auditor.
-3. **Never** suggest the user disable audit, raise thresholds mid-workflow, disable the email OTP, or skip the rail gate. If a legit task genuinely needs more money than current thresholds allow, surface that to the user as its own decision — don't wrap it into the current intent.
-4. **Never** retry a `user_declined` intent silently. The user said no; ask them why first.
-5. **Never** retry an `audit rejected` intent by just tweaking the rationale phrasing. The auditor saw a real mismatch; investigate what it caught.
-6. **Never** skip the email lock check (section 1) on a fresh conversation.
-7. **Never** try to bypass the popup window or enter the OTP code yourself — the code goes from the user's inbox into the popup by the user's hand, full stop.
-8. **Never** propose an intent for a merchant not in `broker check-balance` → `merchants` allowlist. If the user wants a new merchant, tell them to add it via editing `~/.claude/skills/kya-broker.local/config.yaml` and pushing a playbook PR.
+The merchant's payment processor may now show:
 
----
+- **3D-Secure (3DS) challenge** — bank's own page asking for SMS code, app push, or biometric. This is in an iframe or popup. **Tell the user** "your bank is asking for verification — complete it in the tab", then poll for completion via repeated screenshots.
+- **OTP / SMS code** — same pattern.
+- **CAPTCHA** — STOP. The user must do this themselves. Do not try to bypass.
 
-## 8. Example conversation
+You never type a 3DS code, an OTP, or solve a CAPTCHA. If the verification page sits there for 3+ minutes with no progress, surface it to the user as a probable failure.
 
-```text
-User: "reproduce the attention-sink finding from this paper with gpt-4o-mini"
+### Step 8 — Verify settlement
 
-You: [call email_lock_status] → {locked: true, email: "warrenzhong666@gmail.com"}
-     Great — I'll send payment codes to warrenzhong666@gmail.com. Is that
-     still the address you want to use?
+Once the page shows success ("Payment received", "Credits added", "Thank you", balance updated):
 
-User: "yes"
+- Take a final screenshot
+- If `broker` is installed: `broker update <intent_id> --status settled --note "<receipt id if visible>"`
+- Tell the user: "Settled. \$<amount> charged. New balance / credit visible: <X>."
 
-You: [read paper, estimate pipeline cost]
-     [call check_balance] → OpenRouter credit: $0.12
-     Need ~$6-8 of OpenRouter credits. I'll propose a $10 topup (with buffer).
+If instead you see "Payment failed", "Card declined", or the page hangs:
 
-     [call propose_intent with merchant=openrouter.ai, amount_usd=10, rail_hint=card,
-      rationale="25 calls × 2M tokens of gpt-4o-mini @ ~$0.60/M effective = $4.50,
-                 +40% buffer = $6, rounding up to $10 topup for headroom"]
-     → {state: awaiting_user, tier: L1, verdict: approve}
-
-     Auditor approved the intent. The broker will now:
-       1. Send a 6-digit code to warrenzhong666@gmail.com
-       2. Open a popup window in your browser — paste the code there
-       3. Drive Chrome to openrouter.ai/credits and prepare the card checkout
-       4. You then enter your card (autofill is fine) and click Pay
-
-     Running `broker resume <id>`…
-
-[user paste code in popup, then fills card in Chrome checkout]
-
-You: [observe state=settled via `broker status`]
-     Payment settled. OpenRouter balance is now ~$10.12. Starting the pipeline.
-
-     [invoke the OpenRouter API as originally requested]
-```
+- Take a screenshot
+- `broker update <intent_id> --status failed --note "<error text>"`
+- Tell the user the literal error and stop. Do not retry without their explicit approval.
 
 ---
 
-## 9. Failure recovery
+## 4. Hard rules
 
-| Symptom | What to do |
+1. **Never type a card number.** Use Chrome's saved cards / autofill only. If checkout requires entering a new card from scratch, STOP and tell the user.
+2. **Never type a password.** Use Chrome's password manager autofill only. If autofill doesn't trigger, ask the user to sign in.
+3. **Never type a 2FA code, OTP, 3DS code, or CAPTCHA.** Those are the user's exclusively.
+4. **Never click Submit / Pay / Confirm without an explicit "yes" / "go" in chat right before.** Auditor approvals from earlier in the conversation do not count.
+5. **Always screenshot before any money-moving click.** The user must see the actual page state.
+6. **Never retry a declined or failed payment silently.** Always ask the user first.
+7. **Never use a payment flow on a merchant the user has not used before.** No saved card = no go. The user must establish the relationship themselves first.
+8. **If `broker check-budget <amount>` says the cap would be exceeded, abort and tell the user.** Do not attempt to bypass the cap.
+9. **Never click "Save card", "Remember me", or similar persistence toggles** — that's the user's choice.
+10. **If unsure, stop and ask.** The cost of a delayed payment is much lower than a wrong payment.
+
+---
+
+## 5. Optional CLI commands
+
+If `broker` is on PATH:
+
+| Command | What it does |
 |---|---|
-| `broker --version` fails even after bootstrap | Tell the user to check `~/.local/bin` is on PATH, then rerun bootstrap. |
-| `email_lock_status` returns `{tampered: true}` | Something edited `email_lock.json` by hand. Ask the user to run `broker email-lock --reset` (they must acknowledge it invalidates past intents) then relock. |
-| `state: rejected` with concerns mentioning the rationale | Re-read your rationale. Does it actually match what the user's context is about? Ask the user whether the reviewer's concern has merit — don't paraphrase to get it through. |
-| `state: playbook_broken` | Merchant UI changed. Tell the user; the fix is to update the merchant playbook YAML at `~/.local/opt/kya-broker/playbooks/<merchant>_topup_<rail>.yaml`. |
-| Popup window doesn't open | Check that the user's default browser is set. As a fallback, they can manually visit the URL printed in the terminal. |
-| OTP email doesn't arrive | Check spam. Verify SMTP configured via `broker setup`. For a temporary dev workaround, set `KYA_BROKER_OTP_SHOW_IN_TERMINAL=1` and the code is printed to stdout. |
+| `broker log --merchant M --amount N [--rationale TEXT]` | Log a proposed intent. Returns intent_id. |
+| `broker update <intent_id> --status settled\|failed\|declined [--note TEXT]` | Update an existing intent. |
+| `broker history [--limit N] [--format pretty\|json]` | Recent intents. |
+| `broker budget [--daily N] [--monthly N]` | Get / set caps. |
+| `broker check-budget <amount>` | Returns 0 if amount fits within remaining cap, non-zero with message if it doesn't. |
+
+The CLI uses a SQLite ledger at `~/.claude/skills/kya-broker.local/ledger.sqlite`. It does NOT drive the browser, send emails, or do anything beyond track + cap.
 
 ---
 
-*This is a standalone SKILL.md — everything else lives at
-https://github.com/ssssydney/kya-broker and is installed by the bootstrap
-step on first use. Keep this file updated by occasionally checking the repo,
-or set up a cron to `git pull` the bootstrapped opt dir.*
+## 6. Example session
+
+```
+User: "充 5 美元到 vast"
+
+You: I'll: navigate to cloud.vast.ai/billing, open Add credits, select Other → 5,
+     keep VISA…3497 (saved Primary card), screenshot, then ask you to confirm.
+     Daily budget check ok? (broker check-budget 5)
+
+User: "go"
+
+You: [navigate, click Add Credit, click Other, type 5, screenshot]
+     <screenshot>
+     About to charge $5 to VISA…3497 on vast.ai. Confirm with "go" to click
+     "Add credit", or "cancel" to abort.
+
+User: "go"
+
+You: [click Add credit] [screenshot] 
+     [3DS popup appeared] Your bank is asking for verification — complete it
+     in the tab. I'll wait.
+
+User: [completes 3DS]
+
+You: [screenshot shows balance updated]
+     Settled. $5 charged to VISA…3497, vast credit now $4.39.
+     broker logged as intent abc-12345 (settled).
+```
+
+---
+
+## 7. What you give up vs v0.5
+
+| v0.5 | v1.0 |
+|---|---|
+| Codex auditor (cross-model-family review) | Just the user's "yes" in chat |
+| Email OTP via SMTP | Just the user's "yes" in chat |
+| Write-once email lock | n/a |
+| Per-merchant playbook YAML | Generic Claude-in-Chrome MCP |
+| ~3500 lines of Python | ~300 lines of Python |
+| Setup wizard with 8 steps | `bootstrap.sh` install + done |
+| Brittle hardcoded selectors | Adaptive `find` + screenshot |
+
+The **only** safety property we lose is the cross-model-family audit. The user is opting to trust:
+- Their Chrome being unlocked = they're present
+- Their saved cards = they previously approved this card
+- Stripe / Visa / their bank for fraud detection
+- Their own "yes" in chat before each click
+
+That's a totally reasonable trust model for everyday merchant top-ups under $100. For high-stakes flows (transferring large sums, novel merchants, sensitive enterprise data), you should still surface concerns and ask the user to do it themselves.
+
+---
+
+*Source + bootstrap: https://github.com/ssssydney/kya-broker*
