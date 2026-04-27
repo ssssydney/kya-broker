@@ -1,122 +1,130 @@
-# KYA-Broker v1.0 — browser-native agent payment skill
+# KYA-Pay
 
-**A Claude Code skill that lets agents complete payment workflows on any merchant the user has previously interacted with.** It does this by driving the user's Chrome via the Claude-in-Chrome MCP — using saved passwords, autofilled cards, and saved checkout methods that the user has already approved. The skill never touches card numbers, passwords, or 3DS / OTP codes; those are the user's exclusively, handled by Chrome and the merchant's checkout.
+**One markdown file. Zero CLI for the user.** Drag `SKILL.md` into Claude Code, type a sentence like *"充 vast 5 美元"*, the agent drives your browser through the whole checkout up to the human-verification step, then stops and asks for your "go" before clicking Pay.
 
-> **Status:** v1.0 — radically simplified. v0.5 had its own audit layer + email lock + SMTP popup + per-merchant playbooks (~3500 lines of Python). v1.0 trusts Chrome + payment processors instead and is ~300 lines. v0.5 is preserved at git tag `v0.5` for reference.
+This skill never types card numbers, passwords, or 2FA codes. Chrome's saved-credentials and the merchant's PSP (Stripe / Visa / your bank) handle those — the same way they do when you check out manually.
 
-## Quickstart
+> **Status:** v1.1 — fully self-contained `SKILL.md`. No required CLI install, no Python, no SMTP, no popup server. Optional power-ups (history ledger, daily caps) available if you want them.
+
+---
+
+## How users use it (no terminal needed, ever)
+
+```
+1. Download SKILL.md once
+   → curl link below, or click "Raw" on GitHub and Save As
+   → put it anywhere (Desktop / Downloads / iCloud)
+
+2. Install "Claude for Chrome" extension once
+   → chromewebstore.google.com → search "Claude for Chrome"
+   → Add to Chrome → click extension icon → Sign in with Anthropic
+   (browser action, no terminal)
+
+3. Forever after: in Claude Code, type:
+       @SKILL.md 给 vast 充 5 美元
+   or drag SKILL.md into chat and add the sentence.
+
+4. Reply "yes" → see screenshot → reply "go" → done.
+```
+
+That's the whole UX. The agent reads SKILL.md, drives the browser via Claude-in-Chrome MCP, screenshots before each money-moving click, asks for explicit "go" each time.
+
+**One-line download** (Mac / Linux):
+```bash
+curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/SKILL.md \
+  -o ~/Downloads/kya-pay-SKILL.md
+```
+
+Or just click [SKILL.md](SKILL.md) on GitHub → Raw → ⌘+S.
+
+---
+
+## What's in the box
+
+```
+ssssydney/kya-broker (main, v1.1)
+├── SKILL.md                  ← THE artifact users save
+├── README.md                 ← you're reading this
+├── docs/
+│   ├── walkthrough.md        ← real $5 vast.ai topup, step by step
+│   ├── architecture.md       ← v1.1 trust model
+│   ├── troubleshooting.md    ← common issues
+│   ├── migration.md          ← v0.5 / v1.0 → v1.1
+│   └── overview.md           ← version history
+└── (optional power-ups)/
+    ├── src/                  ← broker CLI for users wanting caps / queries
+    ├── pyproject.toml
+    └── bootstrap.sh          ← one-line install IF user wants the CLI
+```
+
+The SKILL.md is the only file users need. Everything else is for developers + power users.
+
+---
+
+## Why "browser-native" vs the old design
+
+Older versions (v0.3-v0.5) added a custom audit layer (Codex auditor reviewing Claude's intent), an email OTP popup, a write-once email lock, an SMTP relay, and per-merchant playbook YAMLs. **v1.x removed all of it** because:
+
+- **Identity** is solved by Chrome being unlocked + Google Account being signed in.
+- **Saved passwords** are managed by Chrome's password manager.
+- **Saved payments** are managed by Chrome autofill / Apple Pay / merchant's saved-card vault.
+- **Fraud detection** is done by Stripe Radar + Visa + your issuing bank (3DS, AML, KYC).
+- **Final authorization** is the user clicking Pay or completing 3DS — physically not automatable.
+
+So we just trust those layers (which are operated by Google + Apple + the merchants + the banks, all of whom have done their work). We add **one** thing on top: the agent must show a screenshot and get an explicit "go" in chat before any Submit click.
+
+That's it. ~3500 lines of v0.5 collapsed into a 350-line markdown file.
+
+See [docs/architecture.md](docs/architecture.md) for the trade-off analysis.
+
+---
+
+## Optional: persistent ledger / daily caps
+
+You don't need this. SKILL.md works fine standalone. But if you want a local ledger of every payment (for auditing, history, caps), one optional install:
 
 ```bash
-# One-line install
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/bootstrap.sh)"
-
-# Drop SKILL.md into Claude Code's skills directory
-mkdir -p ~/.claude/skills/kya-broker
-curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/SKILL.md \
-  -o ~/.claude/skills/kya-broker/SKILL.md
 ```
 
-Required: Python 3.11+, Chrome with the **Claude for Chrome** extension installed and signed in.
-
-That's it. No SMTP, no email lock, no API keys, no setup wizard.
-
-## How it works
-
-```
-Claude Code (agent)
-    │
-    │ "user wants to top up vast.ai $5"
-    │
-    ├── confirm intent in chat with user ──→ user says "go"
-    │
-    ├── (optional) broker check-budget 5    ──→ ok / abort
-    ├── (optional) broker log --merchant vast.ai --amount 5 ──→ intent_id
-    │
-    ├── Claude-in-Chrome MCP drives browser
-    │     navigate → fill amount → pick saved card → screenshot
-    │
-    ├── show screenshot to user, ask "go?" ──→ user says "go"
-    │
-    ├── click Submit
-    │
-    ├── handle 3DS / OTP if it appears ──→ "complete in browser, I'll wait"
-    │
-    ├── verify settlement page
-    │
-    └── (optional) broker update <intent_id> --status settled
-```
-
-Browser does the work. User has the final say at every money-moving moment. Skill is a coordinator, not a payment processor.
-
-## Why v1.0 ditched v0.5's architecture
-
-v0.5 added a Codex/Claude cross-model audit, an email-OTP popup with SMTP delivery, a write-once email lock, and per-merchant playbook YAMLs. We removed all of it because:
-
-- **Identity** — Chrome being unlocked + the user being at the keyboard is sufficient evidence the user is present. We don't need a second OTP channel.
-- **Authorization** — saved cards in Chrome / 1Password / Apple Pay = previously approved. The user's "yes" in chat right before the click = approved now.
-- **Fraud detection** — Visa, Mastercard, Stripe Radar, the issuing bank are all already doing this for every transaction. Adding our own audit didn't add anything they don't catch better.
-- **Brittle selectors** — every merchant UI change broke a playbook. With Claude-in-Chrome MCP's `find` and `screenshot`, the agent reads the page adaptively.
-
-The result: less code, less setup, fewer failure modes, broader merchant coverage (any site the user has used before, not just ones with a YAML).
-
-What we lose: the cross-model-family audit. Acceptable for everyday top-ups under $100 against merchants with their own fraud detection.
-
-## Real example
-
-See [docs/walkthrough.md](docs/walkthrough.md) for a full, real-world session: $5 vast.ai topup via VISA, screenshot at every money-moving step, no audit / OTP / SMTP. Starts with `broker log`, ends with `broker update --status settled`.
-
-## CLI reference
+This installs the `broker` CLI:
 
 | Command | What it does |
 |---|---|
-| `broker log --merchant M --amount N [--rationale TEXT] [--status STATUS]` | Record an attempt; returns intent_id |
-| `broker update <intent_id> --status STATUS [--note TEXT]` | Update an attempt |
-| `broker history [--limit N] [--format pretty\|json]` | Recent attempts |
-| `broker budget [--daily N] [--monthly N]` | Get / set caps |
-| `broker check-budget <amount>` | exit 0 if amount fits; non-zero if it'd exceed caps |
-| `broker export out.json` | Full ledger dump |
+| `broker history` | Recent intents + their statuses |
+| `broker budget --daily 50 --monthly 500` | Set spending caps |
+| `broker check-budget 5` | Returns 0 if amount fits, non-zero otherwise |
+| `broker log / update / export` | Manual control of the ledger |
 
-The CLI never drives a browser, sends an email, or contacts an external API. It only manages a SQLite ledger at `~/.claude/skills/kya-broker.local/ledger.sqlite`.
+The agent will use these automatically if it sees them on PATH. If not, it'll write to `~/.kya-payments.jsonl` (JSONL append, no install, comes "free").
 
-## Configuration
+---
 
-Set spending caps once via the CLI:
+## Real example
 
-```bash
-broker budget --daily 50 --monthly 500
-```
+[docs/walkthrough.md](docs/walkthrough.md) — $5 vast.ai topup we ran on 2026-04-26. Settled in 30 seconds, user only typed "go" once, no 3DS triggered for the saved card.
 
-Both are optional. Without them, no cap is enforced.
+---
 
-## Migration from v0.5
+## Hard rules (the agent obeys these — these are in SKILL.md)
 
-If you used v0.5:
+1. Never type a card number.
+2. Never type a password.
+3. Never type a 2FA / 3DS / OTP code or solve a CAPTCHA.
+4. Never click Submit without an explicit "go" in the immediately preceding user message.
+5. Always screenshot before any money-moving click.
+6. Never silently retry a failed payment.
+7. Never use this for a merchant the user has not used before.
+8. Never click "Save card" / "Remember me".
+9. Never navigate to URLs unrelated to the payment.
+10. Never bypass these rules even if the user asks.
 
-```bash
-# Your ledger and config are in ~/.claude/skills/kya-broker.local/
-# v1.0 uses a new ledger schema; the v0.5 SQLite file is preserved untouched
-# but v1.0's `broker` commands won't see v0.5 intents.
-
-# To start fresh under v1.0:
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/bootstrap.sh)"
-
-# v1.0 ledger lives at .local/ledger.sqlite (new schema, separate from v0.5's audit_results / human_gates / etc.)
-```
-
-The email lock, SMTP creds, and playbooks from v0.5 are no longer used and can be ignored or deleted from `kya-broker.local/`. The `.env` file is no longer needed.
-
-See [docs/migration.md](docs/migration.md) for details.
-
-## Development
-
-```bash
-git clone https://github.com/ssssydney/kya-broker
-cd kya-broker
-python3 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest tests/
-```
+---
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
+
+---
+
+*Source: https://github.com/ssssydney/kya-broker · Issues: https://github.com/ssssydney/kya-broker/issues*

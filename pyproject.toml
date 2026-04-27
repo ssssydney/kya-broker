@@ -1,7 +1,7 @@
 [project]
 name = "kya-broker"
-version = "1.0.0"
-description = "Browser-native agent payment skill for Claude Code — thin ledger + budget caps"
+version = "1.1.0"
+description = "Optional CLI companion to kya-pay SKILL.md — thin SQLite ledger + spending caps. The skill itself is just SKILL.md and needs no install."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

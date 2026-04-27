@@ -1,241 +1,308 @@
 ---
-name: kya-broker
-description: Browser-native agent payment skill. Use when the user asks Claude Code to make a paid action on the web (top up credits at any merchant, pay a subscription, complete a checkout, etc.) AND the user has previously interacted with that merchant in their Chrome browser (saved password, autofilled card, or saved checkout method). Trigger on explicit "pay / top up / buy / charge / 充值 / 付款 / 支付" requests. Do NOT trigger for general coding help, research reading, or any task that doesn't involve money. Before any money-moving click, you must show the user a screenshot of what's about to happen and get an explicit "yes" in chat.
+name: kya-pay
+description: Browser-native agent payment skill. Use when the user explicitly asks Claude Code to make a paid action on the web — top up credits at a merchant the user has used before (vast.ai, OpenRouter, Anthropic Console, Replicate, Modal, etc.), pay a subscription, complete a saved-card checkout. Trigger on phrases like "pay / top up / charge / buy credits / 充值 / 付款 / 支付 / 充 N 美元". DO NOT trigger for: general coding help, research questions, merchants the user has never used (no saved card on file), or anything that isn't a money-moving web action. Before any money-moving click you MUST take a screenshot and get the user's explicit "go" / "yes" / "confirm" in the immediately preceding chat message — confirmation from earlier in the conversation does NOT count.
 ---
 
-# KYA Broker — Browser-Native Payment Skill (v1.0)
+# KYA-Pay — Browser-native Agent Payment Skill (v1.1)
 
-You drive the user's Chrome via the **Claude-in-Chrome MCP** to complete payment workflows on any merchant where the user has an existing account and saved payment methods. You do NOT touch card numbers, passwords, or seed phrases — Chrome's own password manager and saved-payments features handle those, and the merchant's checkout (Stripe / PayPal / etc.) handles the actual transaction. Your job is to drive the browser up to the human-verification moment, surface that moment to the user, and stop.
+You're an agent reading this file because the user wants you to make a payment for them on the web. They gave you me as either an attached file in this conversation OR a saved file at `~/.claude/skills/kya-pay/SKILL.md`. Either way, the protocol below is identical. Just follow it.
 
-Source / updates: **https://github.com/ssssydney/kya-broker**
-
----
-
-## 0. Philosophy (read this first)
-
-Earlier versions of this skill (v0.3-v0.5) added a custom audit layer, an email OTP popup, a write-once email lock, an SMTP relay, and per-merchant playbook YAMLs. **All of that has been removed.** It was reinventing infrastructure that browsers and payment companies already do better:
-
-- **Identity** is solved by Chrome being unlocked + Google Account being signed in. If the user is at their unlocked Mac with Chrome open, they ARE the user.
-- **Saved passwords** for site logins are managed by Chrome's password manager (or 1Password, Bitwarden — whatever the user uses).
-- **Saved payment methods** are managed by Chrome autofill, Apple Pay, Google Pay, and the merchant's own card-on-file storage. They've done the KYC.
-- **Fraud detection** is done by the issuing bank (3DS), the network (Visa/MC), and the merchant (Stripe Radar).
-- **Final authorization** is the user clicking Pay or completing 3DS, which the broker physically cannot do.
-
-The only thing this skill adds on top of "Claude drives a browser" is:
-
-1. **Friction at money-moving moments** — you must screenshot and ask the user "yes" in chat before clicking Submit / Pay / Confirm.
-2. **A local ledger** (optional, via the `agentpay` CLI) — so the user can see history and enforce daily/monthly caps.
-3. **A clear set of hard rules** for what you do and don't touch in the browser.
-
-That's it. Keep it minimal.
+> **No install required for the basic case.** You don't need Python, broker CLI, SMTP, SSH, or anything else. You only need Claude-in-Chrome MCP tools (which are part of Claude Code) and a Chrome browser the user has signed in to. Everything else is in this file.
 
 ---
 
-## 1. Bootstrap (one-time, ~30 seconds)
+## §0 — Sanity check (do this FIRST, before anything else)
 
-The `agentpay` CLI is optional but useful for spending caps + history. To install:
+Run this one MCP call:
 
-```bash
-broker --version 2>/dev/null || \
-  bash -c "$(curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/bootstrap.sh)"
+```
+mcp__Claude_in_Chrome__list_connected_browsers
 ```
 
-After install, `broker` is available on PATH. If you can't or don't want to install, you can still use this skill — just skip steps that mention `broker`.
+| If it returns | What it means | What you do |
+|---|---|---|
+| `[]` (empty array) | No Chrome extension paired | **STOP.** Tell user: *"I need the Claude for Chrome extension to drive your browser. Please open Chrome → visit https://chromewebstore.google.com/ → search 'Claude for Chrome' → Add to Chrome → click extension icon → Sign in with Anthropic. Then ask me again."* Do not proceed. |
+| `[{deviceId: ..., isLocal: true, ...}]` (one or more) | At least one browser ready | Continue to §2. |
 
-You also need the **Claude for Chrome** browser extension installed and signed in for `mcp__Claude_in_Chrome__*` tools to work. If `mcp__Claude_in_Chrome__list_connected_browsers` returns `[]`, ask the user to install it from `https://chromewebstore.google.com/` (search "Claude for Chrome") and sign in.
-
----
-
-## 2. When to use this skill
-
-Trigger when the user asks for:
-
-- "Top up X dollars / credits at Y merchant" (vast.ai, OpenRouter, Anthropic, Replicate, …)
-- "Pay for / renew this subscription"
-- "Buy / order this thing on Amazon / Taobao / etc."
-- Any web checkout where the user **already has an account** and **already has a payment method on file** in Chrome or with that merchant.
-
-Do NOT trigger when:
-
-- The user is asking a question or doing research
-- The merchant is unfamiliar (newly registered domain, no Chrome saved credentials, user hasn't used it before)
-- The user explicitly says not to make payments
-- The flow requires **entering NEW card details for the first time** (the user should do that themselves; you don't type card numbers, ever)
+If multiple browsers, prefer the one with `isLocal: true`. Call `mcp__Claude_in_Chrome__select_browser({deviceId})` to lock onto it.
 
 ---
 
-## 3. The workflow
+## §1 — When to trigger / when not
 
-### Step 1 — Intent confirmation (in chat, before any browser action)
+**Trigger** when the user's most recent message asks for one of:
 
-Confirm with the user **in chat** before opening the browser:
+- "充 X 美元到 Y" / "给 Y 充 X" / "Top up Y by $X" / "Pay X to Y" / "Buy X credits at Y"
+- Any explicit money-moving web action where the merchant is identifiable
 
-> "I'm going to: (a) navigate to **<merchant>**, (b) sign you in if needed, (c) start a top-up of **\$<amount>** using your saved payment method. Confirm?"
+**Do NOT trigger** when:
 
-Do not start the browser flow until they say yes (or equivalent). If the user has set spending caps via `broker budget`, run `broker check-budget <amount>` first; if it fails, surface the cap to the user before asking for confirmation.
+- The user is asking a question, doing research, debugging code, or making a non-payment request
+- The merchant isn't named OR is one the user has clearly never used (no saved card on file)
+- The user has explicitly said something like "don't pay anything" earlier in the conversation
+- The amount looks unreasonable (e.g., "充 $10000" when user normally tops up $10) — STOP and ask first
+- The user wants to ADD a new card from scratch — you can navigate to the page but tell them they have to type the card number themselves; you never type card numbers
 
-### Step 2 — Drive the browser
+When in doubt: ask the user to clarify in chat before driving the browser.
 
-Use these MCP tools:
+---
 
-- `mcp__Claude_in_Chrome__list_connected_browsers` — confirm Chrome is connected
-- `mcp__Claude_in_Chrome__select_browser` — pick the user's Chrome (use `isLocal: true`)
-- `mcp__Claude_in_Chrome__tabs_context_mcp` — get the MCP tab group
-- `mcp__Claude_in_Chrome__tabs_create_mcp` — make a fresh tab for this conversation
-- `mcp__Claude_in_Chrome__navigate` — go to the merchant's page
-- `mcp__Claude_in_Chrome__read_page` — inspect interactive elements (refs)
-- `mcp__Claude_in_Chrome__find` — locate elements by natural language
-- `mcp__Claude_in_Chrome__computer` — `screenshot`, `left_click`, `type`, `scroll` etc.
+## §2 — Workflow
 
-Always create a new tab for the payment flow — don't reuse the user's existing tabs.
+### Step 1 — Confirm intent in chat (no browser action yet)
 
-### Step 3 — Login (if needed)
+Reply in chat with a one-liner like:
 
-If you land on a sign-in page:
+> "I'll: navigate to **<merchant>.com**, open the top-up page, fill **$<amount>**, and use your saved payment method. I'll show you a screenshot before clicking Pay. Confirm? (reply 'yes' / 'cancel')"
 
-- **Google OAuth button visible?** Click it — Chrome will use the signed-in Google account automatically.
-- **Email + Password fields?** Click into the email field; if Chrome's password manager has saved credentials, an autofill suggestion appears — click it. The fields populate automatically. Click sign in.
-- **Neither autofills nor has a Google option?** STOP. Ask the user to sign in manually in the tab, then say "ok ready" before continuing.
-- **2FA / OTP screen?** STOP. Ask the user to complete it in the tab, then say "ready".
+Wait for "yes" / "ok" / "go" / "好" / equivalent. If anything ambiguous → cancel.
 
-You never type a password directly. You never type a 2FA code.
+### Step 2 — Open a fresh tab
 
-### Step 4 — Fill the checkout form
-
-Once on the checkout / top-up page:
-
-- **Amount field** — type the amount the user authorized.
-- **Payment method radio** — click the saved card / saved payment method (e.g., "VISA…3497"). **Never click "Add new card" or any flow that requires typing a card number.** If no saved method is visible, STOP and tell the user to add one manually first.
-- **Avoid clicking Submit / Pay / Confirm yet.**
-
-### Step 5 — Screenshot + final confirm in chat
-
-Take a screenshot of the form in its final state with `screenshot` action. Show the user:
-
-> "About to charge **\$<amount>** to **<saved method>** on **<merchant>**. <screenshot>. Confirm with 'go' to proceed, or 'cancel'."
-
-Do not click Submit until they reply with an explicit "go" / "yes" / "confirm" / "proceed" or equivalent. **Anything ambiguous = cancel.**
-
-If the user has the `broker` CLI installed, log the attempt before clicking:
-
-```bash
-broker log --merchant <m> --amount <a> --rationale "<short reason>" --status proposed
+```
+mcp__Claude_in_Chrome__tabs_context_mcp({createIfEmpty: true})
+mcp__Claude_in_Chrome__tabs_create_mcp()
 ```
 
-This returns an `intent_id` you'll use to update status later.
+Always create a fresh tab for the payment. Don't reuse user's existing tabs (might have leftover state from their browsing).
 
-### Step 6 — Submit
+### Step 3 — Navigate to the merchant's billing / topup page
 
-Click the Pay / Submit / Confirm button. Take a screenshot immediately after.
+Use the most direct URL you know for the merchant. Common patterns:
 
-### Step 7 — Handle verification gates
+| Merchant | Topup URL |
+|---|---|
+| vast.ai | https://cloud.vast.ai/billing/ |
+| OpenRouter | https://openrouter.ai/credits |
+| Anthropic Console | https://console.anthropic.com/settings/billing |
+| Replicate | https://replicate.com/account/billing |
+| Modal | https://modal.com/settings/billing |
+| RunPod | https://runpod.io/console/user/billing |
+
+Don't know the URL? Try `<merchant>.com/billing` or `<merchant>.com/account/billing` first; fall back to the merchant's homepage and navigate from there.
+
+### Step 4 — Handle login if redirected
+
+If the page is a login screen instead of the billing page:
+
+| Login type | What you do |
+|---|---|
+| "Continue with Google" button | Click it. Chrome's signed-in Google session usually auto-completes. |
+| "Continue with GitHub" / similar OAuth | Same — click and let it autofill. |
+| Email + password fields | Click into the email field → if Chrome's password manager has saved credentials, an autofill suggestion appears below — click that. The fields populate automatically. Click sign in. |
+| 2FA / OTP / passkey screen | **STOP.** Tell user: *"There's a 2FA challenge. Please complete it in the tab, then say 'ready' here."* Wait for them to finish. |
+| Captcha | **STOP.** Tell user: *"Captcha — please solve it in the tab, then say 'ready'."* |
+
+You **never type passwords**. You **never type 2FA codes / OTPs**. You **never solve captchas**.
+
+If Chrome's autofill doesn't kick in and the user hasn't saved this site's password, STOP and tell the user to sign in manually.
+
+### Step 5 — Fill the topup form
+
+`mcp__Claude_in_Chrome__find` is your friend for adaptive selectors:
+
+```
+find({query: "Add Credits button"})    → ref_X
+find({query: "amount input field"})    → ref_Y  
+find({query: "saved card or VISA radio"})  → ref_Z
+```
+
+Click "Add Credits" / "Top up" / equivalent → modal opens.
+
+Set the amount:
+- If a custom amount input exists, focus it and type the number.
+- If only preset radios ($10, $25, $100), pick the smallest preset that ≥ user's requested amount, OR click "Other" / "Custom" first to reveal a custom input.
+
+Select payment method:
+- **MUST** click a saved card radio (VISA…1234, etc.) or saved method.
+- **NEVER** click "Add new card", "Enter card details", "New payment method".
+- If there's no saved method visible, **STOP** and tell user they need to add one first themselves.
+
+Verify the form is in the right state (amount = N, saved card selected, no "Add new card" radio active).
+
+### Step 6 — Screenshot + final "go" check
+
+```
+mcp__Claude_in_Chrome__computer({action: "screenshot", save_to_disk: true, tabId})
+```
+
+Show the screenshot to the user. In chat, write:
+
+> "About to charge **$<amount>** to **<saved method label>** on **<merchant>**. <screenshot>. Reply **'go'** to click Pay, or **'cancel'**."
+
+Wait for explicit "go" / "yes" / "confirm" / "proceed" / equivalent in the **immediately following message** (not from earlier).
+
+**If the user replies anything ambiguous** ("hmm", "wait", "ok let me think", "looks ok"), treat as cancel. Ask again with crisper wording.
+
+### Step 7 — Click Submit
+
+Once you have the explicit go:
+
+```
+find({query: "Pay button" or "Submit" or "Add credit" or "Confirm"}) → ref
+mcp__Claude_in_Chrome__computer({action: "left_click", ref, tabId})
+```
+
+Take a screenshot immediately after.
+
+### Step 8 — Handle post-submit gates
 
 The merchant's payment processor may now show:
 
-- **3D-Secure (3DS) challenge** — bank's own page asking for SMS code, app push, or biometric. This is in an iframe or popup. **Tell the user** "your bank is asking for verification — complete it in the tab", then poll for completion via repeated screenshots.
-- **OTP / SMS code** — same pattern.
-- **CAPTCHA** — STOP. The user must do this themselves. Do not try to bypass.
+| Gate | What you see | What you do |
+|---|---|---|
+| 3D-Secure (3DS) | Bank's iframe with text/code field | Tell user: *"Your bank is asking for 3D-Secure. Complete it in the tab — could be SMS code, app push, or biometric. I'll wait."* Re-screenshot every 30s. Don't click anything. |
+| SMS / Email OTP | "Enter the code we just sent" | Same: tell user to type it themselves. |
+| Phone push approval | "Approve in your bank app" | Same: tell user to approve. |
+| CAPTCHA | "Confirm you're human" | **STOP.** Don't try to solve. Tell user. |
+| Network error / timeout | Spinning forever / "An error occurred" | Wait up to 60s. If still frozen, tell user — don't auto-retry. |
 
-You never type a 3DS code, an OTP, or solve a CAPTCHA. If the verification page sits there for 3+ minutes with no progress, surface it to the user as a probable failure.
+After 3 minutes of any gate sitting unresolved, surface to user and stop polling.
 
-### Step 8 — Verify settlement
+### Step 9 — Verify settlement
 
-Once the page shows success ("Payment received", "Credits added", "Thank you", balance updated):
+Once you see indicators of success on the page (text like "Payment received", "Credits added", "Thank you", balance updated):
 
 - Take a final screenshot
-- If `broker` is installed: `broker update <intent_id> --status settled --note "<receipt id if visible>"`
-- Tell the user: "Settled. \$<amount> charged. New balance / credit visible: <X>."
+- Tell the user something like: *"Settled. **$X** charged to **<method>** on **<merchant>**. New balance: **$Y**."*
 
-If instead you see "Payment failed", "Card declined", or the page hangs:
-
+If you instead see "Payment failed", "Card declined", "Insufficient funds", or anything indicating failure:
 - Take a screenshot
-- `broker update <intent_id> --status failed --note "<error text>"`
-- Tell the user the literal error and stop. Do not retry without their explicit approval.
+- Tell the user the literal error
+- **DO NOT silently retry.** Ask the user what to do.
 
----
+### Step 10 — Optional: log the payment
 
-## 4. Hard rules
+If the user wants a local record of payments (to look back at history, set caps, audit later), append a line to `~/.kya-payments.jsonl`:
 
-1. **Never type a card number.** Use Chrome's saved cards / autofill only. If checkout requires entering a new card from scratch, STOP and tell the user.
-2. **Never type a password.** Use Chrome's password manager autofill only. If autofill doesn't trigger, ask the user to sign in.
-3. **Never type a 2FA code, OTP, 3DS code, or CAPTCHA.** Those are the user's exclusively.
-4. **Never click Submit / Pay / Confirm without an explicit "yes" / "go" in chat right before.** Auditor approvals from earlier in the conversation do not count.
-5. **Always screenshot before any money-moving click.** The user must see the actual page state.
-6. **Never retry a declined or failed payment silently.** Always ask the user first.
-7. **Never use a payment flow on a merchant the user has not used before.** No saved card = no go. The user must establish the relationship themselves first.
-8. **If `broker check-budget <amount>` says the cap would be exceeded, abort and tell the user.** Do not attempt to bypass the cap.
-9. **Never click "Save card", "Remember me", or similar persistence toggles** — that's the user's choice.
-10. **If unsure, stop and ask.** The cost of a delayed payment is much lower than a wrong payment.
-
----
-
-## 5. Optional CLI commands
-
-If `broker` is on PATH:
-
-| Command | What it does |
-|---|---|
-| `broker log --merchant M --amount N [--rationale TEXT]` | Log a proposed intent. Returns intent_id. |
-| `broker update <intent_id> --status settled\|failed\|declined [--note TEXT]` | Update an existing intent. |
-| `broker history [--limit N] [--format pretty\|json]` | Recent intents. |
-| `broker budget [--daily N] [--monthly N]` | Get / set caps. |
-| `broker check-budget <amount>` | Returns 0 if amount fits within remaining cap, non-zero with message if it doesn't. |
-
-The CLI uses a SQLite ledger at `~/.claude/skills/kya-broker.local/ledger.sqlite`. It does NOT drive the browser, send emails, or do anything beyond track + cap.
-
----
-
-## 6. Example session
-
-```
-User: "充 5 美元到 vast"
-
-You: I'll: navigate to cloud.vast.ai/billing, open Add credits, select Other → 5,
-     keep VISA…3497 (saved Primary card), screenshot, then ask you to confirm.
-     Daily budget check ok? (broker check-budget 5)
-
-User: "go"
-
-You: [navigate, click Add Credit, click Other, type 5, screenshot]
-     <screenshot>
-     About to charge $5 to VISA…3497 on vast.ai. Confirm with "go" to click
-     "Add credit", or "cancel" to abort.
-
-User: "go"
-
-You: [click Add credit] [screenshot] 
-     [3DS popup appeared] Your bank is asking for verification — complete it
-     in the tab. I'll wait.
-
-User: [completes 3DS]
-
-You: [screenshot shows balance updated]
-     Settled. $5 charged to VISA…3497, vast credit now $4.39.
-     broker logged as intent abc-12345 (settled).
+```bash
+mkdir -p ~ && echo '{"timestamp":"<ISO>","merchant":"<m>","amount_usd":<n>,"status":"settled","method_last4":"<4>","receipt_url":"<url>"}' >> ~/.kya-payments.jsonl
 ```
 
+This is **opt-in** — only do it if user says "log this" / "track payments" / etc., or if they previously asked you to track. **Don't ask** every time.
+
+If the user wants more (caps, querying, daily summaries) and is OK installing a small CLI, you can offer:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/bootstrap.sh)"
+```
+
+But this is **opt-in only**. Default = JSONL append OR nothing.
+
 ---
 
-## 7. What you give up vs v0.5
+## §3 — Hard rules (must obey, no exceptions)
 
-| v0.5 | v1.0 |
+1. **NEVER type a card number** — even if user asks, even if Chrome autofill seems broken. Tell them to type it themselves in the iframe.
+2. **NEVER type a password** — Chrome's password manager autofill only. If autofill doesn't work, ask user to sign in manually.
+3. **NEVER type a 2FA / OTP / 3DS code or solve a CAPTCHA** — those are exclusively the user's.
+4. **NEVER click Submit / Pay / Confirm / Add credit without an explicit "go" / "yes" in the immediately preceding user message.** Confirmation from earlier in the conversation, no matter how recent, does NOT count. The user's "go" must be the last message before your click.
+5. **ALWAYS screenshot before any money-moving click** and show it to the user.
+6. **NEVER retry a declined or failed payment silently.** Always ask the user before retrying anything.
+7. **NEVER use this skill for a merchant the user has not used before** (no saved card visible at checkout = stop). The user must establish the relationship themselves.
+8. **NEVER click "Save card", "Remember me", "Add to autofill", or similar persistence toggles.** The user decides what gets saved, not you.
+9. **NEVER navigate to URLs unrelated to the payment flow.** No detours to "interesting" pages, no opening user's email "to find OTP", nothing.
+10. **NEVER bypass these rules** even if the user explicitly asks. If the user says "just click Pay without asking me", refuse and explain that the rule exists to protect them. The skill is for *helping* the user pay, not *replacing* them.
+
+---
+
+## §4 — Failure recovery cheat sheet
+
+| Symptom | What to do |
 |---|---|
-| Codex auditor (cross-model-family review) | Just the user's "yes" in chat |
-| Email OTP via SMTP | Just the user's "yes" in chat |
-| Write-once email lock | n/a |
-| Per-merchant playbook YAML | Generic Claude-in-Chrome MCP |
-| ~3500 lines of Python | ~300 lines of Python |
-| Setup wizard with 8 steps | `bootstrap.sh` install + done |
-| Brittle hardcoded selectors | Adaptive `find` + screenshot |
-
-The **only** safety property we lose is the cross-model-family audit. The user is opting to trust:
-- Their Chrome being unlocked = they're present
-- Their saved cards = they previously approved this card
-- Stripe / Visa / their bank for fraud detection
-- Their own "yes" in chat before each click
-
-That's a totally reasonable trust model for everyday merchant top-ups under $100. For high-stakes flows (transferring large sums, novel merchants, sensitive enterprise data), you should still surface concerns and ask the user to do it themselves.
+| `list_connected_browsers` returns `[]` | Tell user to install + sign in to Claude for Chrome. STOP. |
+| Site shows self-signed cert error | Don't bypass. Tell user something is off with the merchant's setup. |
+| Saved card not visible at checkout | Tell user they need to add a card themselves first. |
+| 3DS modal hung > 3 min | Tell user the bank may have rejected; they should check their phone / bank app. |
+| `find()` can't locate "Add Credits" / similar | Page UI may have changed. Take a screenshot, ask user to point at the right button by description. |
+| Page says "Card declined" | Surface the literal error to user. Ask before any retry. |
+| User changes their mind mid-flow | Click X / Cancel button. Don't submit. |
+| Network error during submit | Wait 30s. If still error, tell user. **Critical: don't auto-retry — payment may have gone through despite the error message.** Tell user to check their card statement / merchant balance manually. |
 
 ---
 
-*Source + bootstrap: https://github.com/ssssydney/kya-broker*
+## §5 — Example session
+
+```
+User: 帮我给 vast.ai 充 5 USD（@SKILL.md 已附上）
+
+Agent (you): I'll: navigate to cloud.vast.ai/billing, open the topup modal,
+             set amount to $5, and use your saved card. I'll show you a
+             screenshot before clicking Pay. Confirm?
+
+User: yes
+
+Agent: [list_connected_browsers → 1 browser found]
+       [select_browser]
+       [tabs_create_mcp → fresh tab]
+       [navigate cloud.vast.ai/billing]
+       [Page loaded; saw VISA…3497 saved as Primary]
+       [find "Add Credit" button → click]
+       [Modal opened; default $10 + VISA…3497]
+       [find "Other" radio → click; find amount input → triple-click + type "5"]
+       [VISA radio still selected ✓]
+       [screenshot]
+
+       About to charge $5 to VISA…3497 on vast.ai. <screenshot>. Reply
+       "go" to click Add credit, or "cancel".
+
+User: go
+
+Agent: [find "Add credit" → click]
+       [wait 5s]
+       [screenshot — modal closed, no 3DS popup, balance showing -$0.61]
+       [navigate billing/ to refresh]
+       [page text shows "Credit: $4.39" + "Apr 26 — Stripe — VISA …3497 — +$5.00"]
+
+       Settled. $5 charged to VISA…3497. vast.ai credit now $4.39.
+       (No 3DS triggered for this saved-card amount.)
+
+User: log this please
+
+Agent: [bash: append to ~/.kya-payments.jsonl]
+       Logged to ~/.kya-payments.jsonl.
+```
+
+---
+
+## §6 — For the human reading this file
+
+If you (the human user) are reading this and wondering "what do I do":
+
+**The shortest path:**
+
+1. Save this `SKILL.md` somewhere on your Mac (Desktop, Downloads — anywhere).
+2. Make sure Chrome is running and you have the **Claude for Chrome** extension installed and signed in (one-time, browser action only — no terminal).
+3. Open Claude Code in any project. Type:
+   ```
+   @<path-to-SKILL.md> 给 vast.ai 充 5 美元
+   ```
+   (or drag-drop the file into chat then write your sentence)
+4. Reply "yes" to confirm intent, then "go" when you see the screenshot.
+
+That's it. No CLI on your end ever. Agent does everything.
+
+**If you want persistent skill registration (so you don't have to attach the file each time):**
+
+Save the file at `~/.claude/skills/kya-pay/SKILL.md`. Claude Code will auto-discover it for every chat on that Mac.
+
+```bash
+mkdir -p ~/.claude/skills/kya-pay && \
+  cp ~/Downloads/SKILL.md ~/.claude/skills/kya-pay/SKILL.md
+```
+
+(or via Finder: drag SKILL.md into ~/.claude/skills/kya-pay/ — make the folder first if needed)
+
+---
+
+## §7 — Origin
+
+Source of truth: **https://github.com/ssssydney/kya-broker**
+
+History — what changed in this skill across versions, in case you care:
+
+- **v1.1** (current) — Removed all required CLI installs. SKILL.md is fully self-contained for the basic flow. Optional JSONL ledger via bash echo if user wants. Optional broker CLI for power users who want spending caps + history queries.
+- **v1.0** — First "browser-native" version. Trusted Chrome + saved cards + user "go". Required broker CLI for ledger.
+- **v0.5** and earlier — Used custom audit layer (Codex + Claude cross-source review), email lock, SMTP OTP popup, per-merchant playbook YAMLs. Deleted in v1.0 because it duplicated work browsers and PSPs already do.
+
+If you want the old behavior (independent audit + email OTP), `git checkout v0.5` from the repo. v1.x is the recommended path.

@@ -1,13 +1,21 @@
-# KYA-Broker — version history
+# KYA-Pay (kya-broker repo) — version history
 
-## v1.0 (current, browser-native)
+## v1.1 (current, zero-CLI for users)
 
-**Released:** 2026-04-26
-**Tag:** `main` (and future `v1.0`)
+**Released:** 2026-04-26 (later same day as v1.0)
+**Tag:** `main` (and `v1.1`)
 
-A Claude Code skill that drives the user's Chrome via the Claude-in-Chrome MCP to complete payment workflows. ~300 lines of Python. No audit, no OTP, no playbooks — just trust Chrome + the merchant's checkout, and gate every money-moving click on the user's "yes" in chat.
+Self-contained `SKILL.md` —— the only file users save. No required CLI install of any kind. Optional broker CLI for power users who want spending caps + ledger queries. JSONL ledger fallback comes "free" (just `echo` from agent's bash).
 
-See [README.md](../README.md) and [architecture.md](architecture.md) for details.
+The product surface for the typical user: drag SKILL.md into Claude Code chat, type "充 vast 5 美元", reply "yes" + "go" twice, done.
+
+See [README.md](../README.md) for the new UX.
+
+## v1.0 (archived)
+
+**Tag:** `v1.0`
+
+First browser-native version. Required broker CLI install (auto via bootstrap.sh). Trust model identical to v1.1; difference is just CLI optionality.
 
 ## v0.5 (archived)
 

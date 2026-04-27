@@ -1,3 +1,24 @@
+# Migrating to v1.1
+
+## v1.0 → v1.1 (same trust model, just simpler distribution)
+
+**Nothing breaks.** v1.1 is a docs + SKILL.md rewrite, not an architecture change. If your v1.0 install (`~/.local/opt/kya-broker/` + `broker` CLI) still works, it still works under v1.1.
+
+What changes:
+- `SKILL.md` rewritten to not assume broker CLI is installed. Self-contained instructions with optional power-up.
+- Default ledger fallback is now `~/.kya-payments.jsonl` (a JSONL file the agent appends to with `echo`). The `broker` CLI's SQLite ledger is still better, just no longer required.
+- README leads with the "drag SKILL.md, type sentence" UX instead of the bootstrap-first UX.
+
+To get v1.1 SKILL.md on a machine you've already set up:
+```bash
+curl -fsSL https://raw.githubusercontent.com/ssssydney/kya-broker/main/SKILL.md \
+  -o ~/.claude/skills/kya-broker/SKILL.md   # or wherever you keep it
+```
+
+That's the entire upgrade. The broker CLI keeps working as before.
+
+---
+
 # Migrating from v0.5 to v1.0
 
 v1.0 is **not backward-compatible** with v0.5 in CLI surface or stored data. Here's what to do.

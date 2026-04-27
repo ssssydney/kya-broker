@@ -1,3 +1,7 @@
-"""KYA-Broker v1.0 — browser-native agent payment skill (thin ledger)."""
+"""KYA-Broker — optional CLI companion to the kya-pay SKILL.md.
 
-__version__ = "1.0.0"
+v1.1: SKILL.md is self-contained; this CLI is a power-up for users who want
+persistent SQLite ledger + spending caps. Install via bootstrap.sh.
+"""
+
+__version__ = "1.1.0"
