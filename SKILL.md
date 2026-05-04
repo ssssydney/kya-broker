@@ -1,9 +1,9 @@
 ---
 name: kya-pay
-description: Browser-native agent payment skill. Use when the user explicitly asks Claude Code to make a paid action on the web — top up credits at a merchant the user has used before (vast.ai, OpenRouter, Anthropic Console, Replicate, Modal, etc.), pay a subscription, complete a saved-card checkout. Trigger on phrases like "pay / top up / charge / buy credits / 充值 / 付款 / 支付 / 充 N 美元". DO NOT trigger for: general coding help, research questions, merchants the user has never used (no saved card on file), or anything that isn't a money-moving web action. Before any money-moving click you MUST take a screenshot and get the user's explicit "go" / "yes" / "confirm" in the immediately preceding chat message — confirmation from earlier in the conversation does NOT count.
+description: Browser-native agent payment skill. Use when the user explicitly asks Claude Code to make a paid action on the web — top up credits at a merchant the user has used before (vast.ai, OpenRouter, Anthropic Console, Replicate, Modal, etc.), pay a subscription, complete a saved-card checkout. Trigger on phrases like "pay / top up / charge / buy credits / 充值 / 付款 / 支付 / 充 N 美元". DO NOT trigger for: general coding help, research questions, merchants the user has never used (no saved card on file), or anything that isn't a money-moving web action. Threshold: micro-payments under $10 USD auto-execute after one initial intent confirmation; payments $10 USD and above require an explicit "go" / "yes" in the chat message immediately before each Submit/Pay click.
 ---
 
-# KYA-Pay — Browser-native Agent Payment Skill (v1.1)
+# KYA-Pay — Browser-native Agent Payment Skill (v1.2)
 
 You're an agent reading this file because the user wants you to make a payment for them on the web. They gave you me as either an attached file in this conversation OR a saved file at `~/.claude/skills/kya-pay/SKILL.md`. Either way, the protocol below is identical. Just follow it.
 
@@ -97,15 +97,42 @@ You **never type passwords**. You **never type 2FA codes / OTPs**. You **never s
 
 If Chrome's autofill doesn't kick in and the user hasn't saved this site's password, STOP and tell the user to sign in manually.
 
-### Step 5 — Fill the topup form
+### Step 5 — Fill the topup form (use DOM-first for speed)
 
-`mcp__Claude_in_Chrome__find` is your friend for adaptive selectors:
+**Tool selection priority (v1.2 change — measurably faster):**
+
+For a flow with **≥3 interactions on the same page** (modal-based topup is usually 4-5: open, select amount, type, select method, submit), prefer a **single `read_page`** at the start over multiple `find()` calls. Reasoning:
+
+| Approach | Round trips | Wall-clock estimate | Accuracy |
+|---|---|---|---|
+| Pixel-only (screenshot + coord) | 2 per click | 2-5s/step | ~70% |
+| `find()` per click (natural language) | 2 per click (find + click) | 0.6-2s/step | ~95% |
+| `read_page` once + click by ref | 1 + N | total ~1-2s for 4 clicks | ~95% |
+
+So:
+
+```
+# Once at the start of the flow:
+tree = mcp__Claude_in_Chrome__read_page({tabId, filter: "interactive", max_chars: 15000})
+# tree contains all clickable refs with role + name
+
+# Then click by ref directly (no find() round trip per step):
+mcp__Claude_in_Chrome__computer({action: "left_click", ref: "ref_24", tabId})
+```
+
+When `read_page` is overkill (single click target, page is huge):
 
 ```
 find({query: "Add Credits button"})    → ref_X
-find({query: "amount input field"})    → ref_Y  
-find({query: "saved card or VISA radio"})  → ref_Z
 ```
+
+**Use `find()` when**: you need to locate one specific element on a complex page; the page just changed and your cached refs are stale.
+
+**Use `read_page` when**: you're about to do a multi-step interaction (modal / form / wizard); you want all interactive elements in one shot.
+
+**Avoid pixel-only (screenshot + coord)** unless you have to — the merchant's checkout flow always has a DOM, use it.
+
+#### Workflow inside the modal (typical):
 
 Click "Add Credits" / "Top up" / equivalent → modal opens.
 
@@ -120,19 +147,29 @@ Select payment method:
 
 Verify the form is in the right state (amount = N, saved card selected, no "Add new card" radio active).
 
-### Step 6 — Screenshot + final "go" check
+### Step 6 — Final confirm gate (threshold-based)
 
-```
-mcp__Claude_in_Chrome__computer({action: "screenshot", save_to_disk: true, tabId})
-```
+#### If amount < $10 USD (auto-execute path)
 
-Show the screenshot to the user. In chat, write:
+Skip the per-step "go" gate. The user already confirmed the intent in Step 1; do NOT re-prompt before each click. Send a one-line update in chat instead:
+
+> "Form ready: $<amount> to <method> on <merchant>. Clicking Pay now."
+
+…and proceed to Step 7 immediately. Take a screenshot only **after** Submit (for the receipt), not before. This minimizes round trips for micro-transactions.
+
+#### If amount ≥ $10 USD (explicit gate path)
+
+Take a screenshot. Show the user. In chat, write:
 
 > "About to charge **$<amount>** to **<saved method label>** on **<merchant>**. <screenshot>. Reply **'go'** to click Pay, or **'cancel'**."
 
 Wait for explicit "go" / "yes" / "confirm" / "proceed" / equivalent in the **immediately following message** (not from earlier).
 
 **If the user replies anything ambiguous** ("hmm", "wait", "ok let me think", "looks ok"), treat as cancel. Ask again with crisper wording.
+
+#### Why the threshold
+
+Micro-payments (under $10) duplicate the rail's own friction without proportional benefit — the saved card already implies user trust, the merchant won't trigger 3DS for low amounts, and the user's intent was clear in Step 1. The per-click gate adds 1-2 round trips of latency for marginal safety. For ≥$10 the same friction is justified: ~$10 is a common bot-fraud threshold; bigger amounts often DO trigger 3DS (so the user is involved anyway); one extra confirmation on a $50+ payment is worth not-yelling-at-yourself-later.
 
 ### Step 7 — Click Submit
 
@@ -196,13 +233,25 @@ But this is **opt-in only**. Default = JSONL append OR nothing.
 1. **NEVER type a card number** — even if user asks, even if Chrome autofill seems broken. Tell them to type it themselves in the iframe.
 2. **NEVER type a password** — Chrome's password manager autofill only. If autofill doesn't work, ask user to sign in manually.
 3. **NEVER type a 2FA / OTP / 3DS code or solve a CAPTCHA** — those are exclusively the user's.
-4. **NEVER click Submit / Pay / Confirm / Add credit without an explicit "go" / "yes" in the immediately preceding user message.** Confirmation from earlier in the conversation, no matter how recent, does NOT count. The user's "go" must be the last message before your click.
-5. **ALWAYS screenshot before any money-moving click** and show it to the user.
+4. **Final-confirm gate is threshold-based** (changed in v1.2):
+   - **Amount < $10**: the user's "yes" in Step 1 (intent confirm) IS sufficient. Proceed without re-prompting before each click.
+   - **Amount ≥ $10**: ALWAYS get an explicit "go" / "yes" in the user message immediately preceding any Submit / Pay / Confirm click. Confirmation from earlier in the conversation does NOT count.
+5. **Screenshot policy** (changed in v1.2):
+   - **Amount ≥ $10**: ALWAYS screenshot before the money-moving click and show it to the user.
+   - **Amount < $10**: screenshot only AFTER submit (for the receipt). Skip the pre-submit screenshot — it's pure latency for micro-transactions where the user already authorized via Step 1.
 6. **NEVER retry a declined or failed payment silently.** Always ask the user before retrying anything.
 7. **NEVER use this skill for a merchant the user has not used before** (no saved card visible at checkout = stop). The user must establish the relationship themselves.
 8. **NEVER click "Save card", "Remember me", "Add to autofill", or similar persistence toggles.** The user decides what gets saved, not you.
 9. **NEVER navigate to URLs unrelated to the payment flow.** No detours to "interesting" pages, no opening user's email "to find OTP", nothing.
-10. **NEVER bypass these rules** even if the user explicitly asks. If the user says "just click Pay without asking me", refuse and explain that the rule exists to protect them. The skill is for *helping* the user pay, not *replacing* them.
+10. **NEVER bypass these rules** even if the user explicitly asks. If user says "just click Pay without asking me, even for $1000", refuse and reaffirm the threshold. The skill is for *helping* the user pay, not *replacing* them at the high-stakes end.
+
+### How to detect the amount tier reliably
+
+When parsing the user's request:
+- "充 5 / 10 / 25 美元" → amounts are explicit. Bucket by the dollar sign (after currency normalization if not USD).
+- "充够这个月用" / "minimum topup" → look up the merchant's minimum and use that. If unknown, use the explicit-gate path (≥$10) to be safe.
+- Multi-currency: convert to USD using the merchant's displayed price. If you can't, use the gate path.
+- If you're computing the amount yourself (e.g., "estimate the cost for X experiment"): use the gate path regardless of size, because the user didn't pick the number.
 
 ---
 
